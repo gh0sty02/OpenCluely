@@ -370,7 +370,7 @@ class OpenRouterService {
       messages: messages,
       stream: true,
       temperature: genConfig.temperature != null ? genConfig.temperature : 0.7,
-      max_tokens: genConfig.max_tokens || 4096
+      max_tokens: genConfig.max_tokens || 2000
     };
     var body = JSON.stringify(bodyObj);
     var options = {
@@ -431,7 +431,7 @@ class OpenRouterService {
       messages: messages,
       stream: false,
       temperature: genConfig.temperature != null ? genConfig.temperature : 0.7,
-      max_tokens: extraParams.max_tokens || genConfig.max_tokens || 4096
+      max_tokens: extraParams.max_tokens || genConfig.max_tokens || 2000
     };
     var body = JSON.stringify(bodyObj);
     var options = {
