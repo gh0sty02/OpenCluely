@@ -296,6 +296,8 @@ class ApplicationController {
         currentDesktop: "detected",
       });
 
+      this.setupTray();
+
       sessionManager.addEvent("Application started");
     } catch (error) {
       this.starting = false;
@@ -303,6 +305,42 @@ class ApplicationController {
         error: error.message,
       });
       app.quit();
+    }
+  }
+
+  setupTray() {
+    try {
+      const { Tray, Menu } = require("electron");
+      const path = require("path");
+      const iconPath = path.resolve(__dirname, "assests/icons/terminal.png");
+      
+      this.tray = new Tray(iconPath);
+      this.tray.setToolTip("OpenCluely AI Assistant");
+      
+      const contextMenu = Menu.buildFromTemplate([
+        {
+          label: "Open Settings",
+          click: () => {
+            windowManager.showWindow("settings");
+          }
+        },
+        { type: "separator" },
+        {
+          label: "Quit OpenCluely",
+          click: () => {
+            app.quit();
+          }
+        }
+      ]);
+
+      this.tray.setContextMenu(contextMenu);
+      this.tray.on("double-click", () => {
+        windowManager.showWindow("settings");
+      });
+
+      logger.info("System Tray initialized successfully");
+    } catch (e) {
+      logger.warn("Failed to initialize System Tray", { error: e.message });
     }
   }
 
