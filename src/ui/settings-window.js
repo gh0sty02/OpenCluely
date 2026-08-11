@@ -220,7 +220,9 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
         geminiKeyInput,
-        windowGapInput
+        windowGapInput,
+        openrouterKeyInput,
+        openrouterModelInput
     ];
 
     inputs.forEach(input => {

@@ -28,6 +28,11 @@ class OpenRouterService {
   // ── Initialization ─────────────────────────────────────────────────
 
   initializeClient() {
+    // Always reset state first so we never keep stale credentials/model.
+    this.apiKey = null;
+    this.model = null;
+    this.isInitialized = false;
+
     const apiKey = config.getApiKey('OPENROUTER');
     if (!apiKey || apiKey === 'your_openrouter_key_here') {
       logger.warn('OpenRouter API key not configured', { keyExists: !!apiKey });
@@ -35,7 +40,10 @@ class OpenRouterService {
     }
     try {
       this.apiKey = apiKey;
-      this.model = config.get('llm.openrouter.model') || 'anthropic/claude-sonnet-4';
+      // Read model directly from process.env so settings changes apply
+      // immediately when initializeClient() is called after save (no restart needed).
+      const envModel = (process.env.OPENROUTER_MODEL || '').trim();
+      this.model = envModel || config.get('llm.openrouter.model') || 'anthropic/claude-sonnet-4';
       this.isInitialized = true;
       logger.info('OpenRouter client initialized successfully', { model: this.model });
     } catch (error) {
@@ -372,7 +380,7 @@ class OpenRouterService {
       messages: messages,
       stream: true,
       temperature: genConfig.temperature != null ? genConfig.temperature : 0.7,
-      max_tokens: genConfig.max_tokens || 2000
+      max_tokens: genConfig.max_tokens || 3000
     };
     var body = JSON.stringify(bodyObj);
     var options = {
@@ -390,7 +398,7 @@ class OpenRouterService {
         if (res.statusCode !== 200) {
           var errBody = '';
           res.on('data', function(c) { errBody += c; });
-          res.on('end', function() { reject(new Error('HTTP ' + res.statusCode + ': ' + errBody)); });
+          res.on('end', function() { clearTimeout(timer); reject(new Error('HTTP ' + res.statusCode + ': ' + errBody)); });
           return;
         }
         var fullText = '', buffer = '';
@@ -411,8 +419,8 @@ class OpenRouterService {
             } catch (e) { /* partial JSON */ }
           }
         });
-        res.on('end', function() { resolve(fullText.trim()); });
-        res.on('error', function(err) { reject(new Error('Streaming response error: ' + err.message)); });
+        res.on('end', function() { clearTimeout(timer); resolve(fullText.trim()); });
+        res.on('error', function(err) { clearTimeout(timer); reject(new Error('Streaming response error: ' + err.message)); });
       });
       var timer = setTimeout(function() { req.destroy(); reject(new Error('OpenRouter streaming request timed out')); }, timeout);
       req.on('error', function(err) { clearTimeout(timer); reject(new Error('Streaming request failed: ' + err.message)); });
@@ -433,7 +441,7 @@ class OpenRouterService {
       messages: messages,
       stream: false,
       temperature: genConfig.temperature != null ? genConfig.temperature : 0.7,
-      max_tokens: extraParams.max_tokens || genConfig.max_tokens || 2000
+      max_tokens: extraParams.max_tokens || genConfig.max_tokens || 3000
     };
     var body = JSON.stringify(bodyObj);
     var options = {
@@ -451,6 +459,7 @@ class OpenRouterService {
         var data = '';
         res.on('data', function(chunk) { data += chunk; });
         res.on('end', function() {
+          clearTimeout(timer);
           try {
             if (res.statusCode !== 200) {
               var errMsg = 'HTTP ' + res.statusCode;
@@ -466,7 +475,7 @@ class OpenRouterService {
             resolve(content.trim());
           } catch (e) { reject(new Error('Failed to parse OpenRouter response: ' + e.message)); }
         });
-        res.on('error', function(err) { reject(new Error('Response error: ' + err.message)); });
+        res.on('error', function(err) { clearTimeout(timer); reject(new Error('Response error: ' + err.message)); });
       });
       var timer = setTimeout(function() { req.destroy(); reject(new Error('OpenRouter request timed out')); }, timeout);
       req.on('error', function(err) { clearTimeout(timer); reject(new Error('Request failed: ' + err.message)); });

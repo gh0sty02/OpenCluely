@@ -33,9 +33,12 @@ class FirstRunManager {
     const content = this._readEnv();
     const provider = (content.LLM_PROVIDER || 'gemini').trim();
     if (provider === 'openrouter') {
-      // When OpenRouter is selected, check its key instead of Gemini's
-      const orKey = (content.OPENROUTER_API_KEY || '').trim();
-      return !orKey || orKey === 'your_openrouter_key_here';
+      // The onboarding wizard only has a Gemini key screen; running it when
+      // OpenRouter is selected would leave the user in an infinite loop
+      // (wizard completes but OPENROUTER_API_KEY is still unset → needsOnboarding
+      // returns true again on every launch). Direct OpenRouter users to
+      // Settings > AI Provider instead — never trigger wizard for them.
+      return false;
     }
     const gemini = (content.GEMINI_API_KEY || '').trim();
     return !gemini || gemini === 'your_gemini_api_key_here';

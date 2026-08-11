@@ -393,6 +393,7 @@ class ApplicationController {
     const shortcuts = {
       "CommandOrControl+Shift+S": () => this.triggerScreenshotOCR(),
       "CommandOrControl+Shift+V": () => windowManager.toggleVisibility(),
+      "CommandOrControl+Shift+A": () => windowManager.toggleAssessmentMode(),
       "CommandOrControl+Shift+I": () => windowManager.toggleInteraction(),
       "CommandOrControl+Shift+C": () => windowManager.switchToWindow("chat"),
       "CommandOrControl+Shift+\\": () => this.clearSessionMemory(),
@@ -1692,8 +1693,8 @@ class ApplicationController {
       if (settings.openrouterKey !== undefined) {
         envUpdates.OPENROUTER_API_KEY = settings.openrouterKey;
       }
-      if (settings.openrouterModel !== undefined && settings.openrouterModel.trim()) {
-        envUpdates.OPENROUTER_MODEL = settings.openrouterModel.trim();
+      if (settings.openrouterModel !== undefined) {
+        envUpdates.OPENROUTER_MODEL = String(settings.openrouterModel || '').trim();
       }
 
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
@@ -1720,17 +1721,16 @@ class ApplicationController {
         }
       }
 
-      // If the OpenRouter key was saved and the current runtime service is
-      // OpenRouter, reinitialize its client so the key is picked up immediately.
-      if (settings.openrouterKey !== undefined && envUpdates.OPENROUTER_API_KEY !== undefined) {
+      // If the OpenRouter key or model was saved and the current runtime service is
+      // OpenRouter, reinitialize its client so changes take effect immediately.
+      if (envUpdates.OPENROUTER_API_KEY !== undefined || envUpdates.OPENROUTER_MODEL !== undefined) {
         try {
-          if (typeof llmService.updateApiKey === 'function' &&
-              llmService.constructor && llmService.constructor.name === 'OpenRouterService') {
-            llmService.updateApiKey(settings.openrouterKey);
-            logger.info("OpenRouter service reinitialized after key update");
+          if (llmService.constructor && llmService.constructor.name === 'OpenRouterService') {
+            llmService.initializeClient();
+            logger.info("OpenRouter service reinitialized after settings update");
           }
         } catch (e) {
-          logger.warn("Failed to reinitialize OpenRouter service after key update", { error: e.message });
+          logger.warn("Failed to reinitialize OpenRouter service after settings update", { error: e.message });
         }
       }
 
