@@ -192,7 +192,9 @@ class OpenRouterService {
       'presentation': ['slide', 'audience', 'public speaking', 'presentation', 'nervous'],
       'data-science': ['data', 'model', 'machine learning', 'statistics', 'analytics', 'python', 'pandas'],
       'devops': ['deployment', 'ci/cd', 'docker', 'kubernetes', 'infrastructure', 'monitoring'],
-      'negotiation': ['negotiate', 'compromise', 'agreement', 'terms', 'conflict resolution']
+      'negotiation': ['negotiate', 'compromise', 'agreement', 'terms', 'conflict resolution'],
+      'code-explanation': ['explain', 'understand', 'how does this work', 'meaning', 'logic', 'trace'],
+      'aptitude': ['math', 'puzzle', 'logic', 'reasoning', 'sequence', 'calculate', 'probability']
     };
     var textLower = (text || '').toLowerCase();
     var relevantKeywords = skillKeywords[activeSkill] || [];
@@ -497,6 +499,8 @@ class OpenRouterService {
       'dsa': 'This appears to be a data structures and algorithms problem. Consider breaking it down into smaller components and identifying the appropriate algorithm or data structure to use.',
       'system-design': 'For this system design question, consider scalability, reliability, and the trade-offs between different architectural approaches.',
       'programming': 'This looks like a programming challenge. Focus on understanding the requirements, edge cases, and optimal time/space complexity.',
+      'code-explanation': 'This looks like code that needs explaining. Consider breaking down the syntax, logic, and overall functionality.',
+      'aptitude': 'This appears to be an aptitude or reasoning question. Focus on logical steps to arrive at the solution.',
       'default': 'I can help analyze this content. Please ensure your OpenRouter API key is properly configured for detailed analysis.'
     };
     var response = fallbackResponses[activeSkill] || fallbackResponses.default;
