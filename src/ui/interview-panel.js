@@ -4,9 +4,16 @@
     const ui = window.InterviewUI;
     const defaultSilenceMs = 3000;
     const silencePresets = new Set([2500, 3000, 4500]);
-    const normalizeSilenceMs = value => {
+    // Matches main process's getAutoAnswerSilenceMs() clamp range: any
+    // explicit positive value is honored, not just the dropdown's three
+    // named presets. Used when sending a value the main process already
+    // holds (e.g. an env-configured custom silence window) so an unrelated
+    // toggle (the auto-answer checkbox) can't silently collapse it to the
+    // nearest preset.
+    const clampSilenceMs = value => {
         const milliseconds = Number(value);
-        return silencePresets.has(milliseconds) ? milliseconds : defaultSilenceMs;
+        if (!Number.isFinite(milliseconds) || milliseconds <= 0) return defaultSilenceMs;
+        return Math.min(10000, Math.max(1000, milliseconds));
     };
     if (!api?.getInterviewState || !ui) return;
 
@@ -110,11 +117,15 @@
     });
     find('interviewAutoAnswer').addEventListener('change', async event => {
         const enabled = event.target.value === 'auto';
-        const silenceMs = normalizeSilenceMs(find('interviewSilenceGap').value);
+        // Read the real current value from the snapshot, not the dropdown:
+        // the dropdown may only be displaying a synthesized "Custom" option
+        // for a non-preset value already in effect (e.g. from .env), and
+        // this toggle must not clobber that value with a coerced preset.
+        const silenceMs = clampSilenceMs(snapshot.autoAnswerSilenceMs);
         await action('set-auto-answer', { enabled, silenceMs });
     });
     find('interviewSilenceGap').addEventListener('change', async event => {
-        const silenceMs = normalizeSilenceMs(event.target.value);
+        const silenceMs = clampSilenceMs(event.target.value);
         await action('set-auto-answer', { enabled: true, silenceMs });
     });
     find('interviewMode')?.addEventListener('change', async event => {
@@ -140,7 +151,25 @@
         find('interviewSource').value = snapshot.source || 'system';
         find('interviewSource').disabled = state.captureActive;
         find('interviewAutoAnswer').value = snapshot.autoAnswer ? 'auto' : 'manual';
-        find('interviewSilenceGap').value = String(normalizeSilenceMs(snapshot.autoAnswerSilenceMs));
+        const silenceSelect = find('interviewSilenceGap');
+        const currentSilenceMs = clampSilenceMs(snapshot.autoAnswerSilenceMs);
+        let customOption = silenceSelect.querySelector('option[data-custom]');
+        if (silencePresets.has(currentSilenceMs)) {
+            customOption?.remove();
+        } else {
+            // A non-preset value is in effect (e.g. a custom AUTO_ANSWER_SILENCE_MS
+            // from .env): represent it truthfully instead of silently displaying
+            // the nearest preset, which would make the next unrelated toggle look
+            // like it's clobbering a value the user never touched.
+            if (!customOption) {
+                customOption = document.createElement('option');
+                customOption.dataset.custom = 'true';
+                silenceSelect.appendChild(customOption);
+            }
+            customOption.value = String(currentSilenceMs);
+            customOption.textContent = `Custom (${(currentSilenceMs / 1000).toFixed(1)}s)`;
+        }
+        silenceSelect.value = String(currentSilenceMs);
         find('interviewSilenceGapWrap').hidden = !snapshot.autoAnswer;
         host.querySelector('[data-action="capture"]').textContent = state.captureActive ? 'Pause listening' : snapshot.captureState === 'paused' ? 'Resume listening' : 'Start listening';
         if (!panel) return;

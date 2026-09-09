@@ -122,7 +122,6 @@ const { promptLoader } = require("./prompt-loader");
 const {
   getAutoAnswerDefault,
   getAutoAnswerSilenceMs,
-  coerceAutoAnswerPreset,
 } = require("./src/core/auto-answer-config");
 
 class ApplicationController {
@@ -644,11 +643,16 @@ class ApplicationController {
             break;
           case "set-auto-answer": {
             const enabled = Boolean(payload.enabled);
-            // The settings UI dropdown only offers the three named presets —
-            // a narrower UI-only constraint, distinct from getAutoAnswerSilenceMs()
-            // (used for the .env value at startup), which honors any explicit
-            // positive value. See src/core/auto-answer-config.js.
-            const silenceMs = coerceAutoAnswerPreset(payload.silenceMs);
+            // Honor any positive value the renderer sends (clamped to a sane
+            // range), not just the settings dropdown's three named presets.
+            // coerceAutoAnswerPreset() is for constraining that dropdown's
+            // own option list, not for re-clamping a value the panel already
+            // resolved (which may be a real .env-configured custom value the
+            // panel is preserving through an unrelated toggle). See
+            // src/core/auto-answer-config.js.
+            const silenceMs = getAutoAnswerSilenceMs({
+              AUTO_ANSWER_SILENCE_MS: payload.silenceMs,
+            });
             this.interviewController.setAutoAnswer(enabled, silenceMs);
             this.persistEnvUpdates({
               AUTO_ANSWER: enabled ? "true" : "false",
