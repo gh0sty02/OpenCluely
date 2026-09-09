@@ -79,7 +79,7 @@ class PromptLoader {
       prompt += `\n\n## Selected mode: ${skill}\n${specialized}`;
     }
     // This final policy resolves strict legacy formats without changing saved modes.
-    prompt += '\n\n## Interview answer policy\nApply the selected mode only when relevant to the current question. Answer off-topic questions directly. For conceptual or behavioral questions, ignore coding-only formatting and do not force code. Start with a concise answer, then add useful supporting detail. Never invent personal facts or experiences; label examples and use placeholders when facts are missing. Follow-ups use the recent conversation.';
+    prompt += '\n\n## Interview answer policy\nApply the selected mode only when relevant to the current question. Answer off-topic questions directly. For conceptual or behavioral questions, ignore coding-only formatting and do not force code. Start with a concise answer, then add useful supporting detail. Never invent personal facts or experiences; label examples and use placeholders when facts are missing. Follow-ups use the recent conversation. The candidate reads this aloud as their own words: write plain spoken sentences with no headers, bullets, or bold outside of code, and avoid stock AI phrasing.';
     if (programmingLanguage) {
       const language = { cpp: 'C++', js: 'JavaScript' }[programmingLanguage] || programmingLanguage;
       prompt += `\nUse ${language} only for relevant code, with correctly tagged code fences. This constraint does not apply to prose. Do not add code just because a language is selected.`;
