@@ -98,6 +98,7 @@ class FirstRunManager {
       llmProvider: (env.LLM_PROVIDER || 'gemini').trim(),
       azureConfigured: !!(env.AZURE_SPEECH_KEY || '').trim() && !!(env.AZURE_SPEECH_REGION || '').trim(),
       whisperConfigured: !!(env.WHISPER_COMMAND || '').trim(),
+      mistralConfigured: !!(env.MISTRAL_API_KEY || '').trim() && (env.MISTRAL_API_KEY || '').trim() !== 'your_mistral_api_key_here',
       needsOnboarding: this.needsOnboarding()
     };
   }

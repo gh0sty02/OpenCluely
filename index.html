@@ -9,10 +9,25 @@
       body {
         margin: 0;
         padding: 0;
-        width: fit-content;
-        height: fit-content;
         background: transparent;
         -webkit-app-region: no-drag;
+      }
+
+      /* This window resizes itself to its content (see resizeWindowToContent()
+         in main-window.js / the "resize-window" IPC handler) rather than
+         filling a fixed viewport, so it needs the opposite of common.css's
+         shared `body.interview-shell { height: 100vh }` (written for
+         chat.html's fixed-size window) — both rules share specificity
+         (one class + one tag), and this file's own <style> loads after the
+         common.css <link>, so this wins the cascade.
+         Width is fixed (matches windowConfigs.main.width in window.manager.js):
+         fit-content collapsed unpredictably once the interview workspace's
+         un-opinionated-width children (textarea, history list) joined the
+         command bar as siblings, each pulling body's shrink-to-fit
+         computation toward their own smaller intrinsic width. */
+      body.interview-shell {
+        width: 520px;
+        height: fit-content;
       }
 
   .command-tab {
@@ -349,9 +364,19 @@
       .shortcuts-footer a:hover {
         text-decoration: underline;
       }
+
+      /* common.css sets .interview-workspace { flex: 1 } for chat.html's
+         fixed-height window, where flex-grow correctly fills remaining
+         space. This window's body is height:fit-content (it resizes itself
+         to its content via main-window.js) with no fixed height to grow
+         into, so flex:1's flex-basis:0% collapses the workspace to 0px.
+         flex-basis:auto makes it take its natural content size instead. */
+      #interviewWorkspace {
+        flex: 0 1 auto;
+      }
     </style>
   </head>
-  <body>
+  <body class="interview-shell">
     <div class="command-tab">
       <div class="command-item">
         <i class="fas fa-camera"></i>
@@ -364,7 +389,7 @@
       <div class="command-separator"></div>
       <div class="command-item" id="skillIndicator">
         <i class="fas fa-brain"></i>
-        <span>DSA</span>
+        <span>Auto interview</span>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="languageSelector">
@@ -459,6 +484,15 @@
       </div>
     </div>
 
+    <main id="interviewWorkspace" class="interview-workspace"><div id="interviewPanel"></div></main>
+    <form class="interview-compose" id="interviewCompose">
+      <label class="sr-only" for="interviewTyped">Type an interview question</label>
+      <textarea id="interviewTyped" rows="2" placeholder="Ask a question or add a follow-up..."></textarea>
+      <button class="interview-button primary" type="submit">Answer</button>
+    </form>
+    <script src="./src/audio/capture.js"></script>
+    <script src="./src/ui/interview-state.js"></script>
+    <script src="./src/ui/interview-panel.js"></script>
     <script src="./src/ui/main-window.js"></script>
   </body>
 </html>

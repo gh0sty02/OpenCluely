@@ -673,12 +673,12 @@
       }
     </style>
   </head>
-  <body>
+  <body class="interview-chat">
     <div class="chat-container" id="chatContainer">
       <div class="chat-header">
         <div class="header-title">
           <i class="fas fa-microphone"></i>
-          Live Transcription & Chat
+          Interview workspace
           <div class="recording-indicator" id="recordingIndicator"></div>
         </div>
         <div class="header-actions">
@@ -691,7 +691,10 @@
       <!-- Interim Text Overlay -->
       <div class="interim-overlay" id="interimOverlay"></div>
 
-      <div class="chat-messages" id="chatMessages"></div>
+      <main class="interview-workspace" id="interviewWorkspace">
+        <div id="interviewPanel"></div>
+        <div class="chat-messages" id="chatMessages"></div>
+      </main>
 
       <div class="chat-input">
         <div class="input-container">
@@ -701,15 +704,19 @@
             id="messageInput"
             rows="1"
           ></textarea>
-          <button class="mic-button" id="micButton">
+          <button class="mic-button" id="micButton" aria-label="Toggle audio capture">
             <i class="fas fa-microphone"></i>
           </button>
-          <button class="send-button" id="sendButton">
+          <button class="send-button" id="sendButton" aria-label="Send question">
             <i class="fas fa-paper-plane"></i>
           </button>
         </div>
       </div>
     </div>
+    <link rel="stylesheet" href="./src/styles/common.css">
+    <script src="./src/audio/capture.js"></script>
+    <script src="./src/ui/interview-state.js"></script>
+    <script src="./src/ui/interview-panel.js"></script>
     <script src="lib/markdown.js"></script>
     <script src="lib/mathrender.js"></script>
     <!-- PrismJS core and autoloader for language components -->
@@ -768,15 +775,27 @@
         }
       }
 
+      // Capture-lifecycle noise the legacy mic/status listeners used to add
+      // as chat "system" messages before the interview panel existed to own
+      // that state — stale copies of these can still be sitting in a
+      // browser's localStorage from before that guard was added. Filtered
+      // out on load so they don't keep resurfacing every time this window opens.
+      const STALE_SYSTEM_NOISE = new Set([
+        'Recording stopped', 'Recording started', 'Stopped Listening',
+        'Recording in Progress. press Alt+Shift+R to stop recording.'
+      ]);
+
       function loadHistory() {
         try {
           const raw = localStorage.getItem(CHAT_HISTORY_KEY);
           if (!raw) return;
           const items = JSON.parse(raw);
           if (Array.isArray(items)) {
-            chatHistory = items;
+            const cleaned = items.filter(item => !(item.kind === 'message' && item.type === 'system' && STALE_SYSTEM_NOISE.has(item.text)));
+            chatHistory = cleaned;
+            if (cleaned.length !== items.length) saveHistory();
             // Render
-            items.forEach(item => {
+            cleaned.forEach(item => {
               if (item.kind === 'message') {
                 addMessage(item.text, item.type, true);
               } else if (item.kind === 'snippet') {
@@ -795,6 +814,7 @@
           if (!ok) return;
         }
         chatHistory = [];
+        if (!skipConfirm) whysperAPI?.interviewAction?.('clear');
         saveHistory();
         // Clear DOM
         if (chatMessages) chatMessages.innerHTML = '';
@@ -886,6 +906,7 @@
 
       // Markdown formatter using markdown.js library
       function formatMarkdown(text) {
+        if (window.InterviewUI) return window.InterviewUI.renderMarkdown(text);
         if (!text) return '';
         
         try {
@@ -1154,6 +1175,7 @@
       // Listen for transcription events
       if (whysperAPI) {
         whysperAPI.onTranscriptionReceived((event, data) => {
+          if (whysperAPI.onInterviewState) return;
           if (data && data.text) {
             handleTranscription(data.text);
           } else {
@@ -1162,6 +1184,7 @@
         });
 
         whysperAPI.onInterimTranscription((event, data) => {
+          if (whysperAPI.onInterviewState) return;
           if (data && data.text) {
             showInterimText(data.text);
           }
@@ -1169,6 +1192,7 @@
 
         // Listen for speech status
         whysperAPI.onSpeechStatus((event, data) => {
+          if (whysperAPI.onInterviewState) return;
           if (data && data.status) {
             addMessage(data.status, 'system');
 
@@ -1188,12 +1212,19 @@
           }
         });
 
-        // Listen for other events
+        // Listen for other events. Same guard as the transcription/status
+        // listeners above: once the interview panel exists it owns capture
+        // state entirely (see #captureStatus in interview-panel.js), so this
+        // legacy mic indicator — and its "Stopped Listening" system message,
+        // which fires on every pause/resume in the interview flow — would
+        // otherwise spam the chat history with noise on every listen toggle.
         whysperAPI.onRecordingStarted(() => {
+          if (whysperAPI.onInterviewState) return;
           handleRecordingStarted();
         });
 
         whysperAPI.onRecordingStopped(() => {
+          if (whysperAPI.onInterviewState) return;
           handleRecordingStopped();
         });
 
@@ -1203,6 +1234,7 @@
 
         // Replace transcription LLM handler to store text + snippets
         whysperAPI.onTranscriptionLlmResponse((event, data) => {
+          if (whysperAPI.onInterviewState) return;
           if (data && data.response) {
             try { hideThinkingIndicator(); } catch (_) {}
             renderAssistantResponse(data.response);
@@ -1217,6 +1249,11 @@
 
       if (micButton) {
         micButton.addEventListener('click', async () => {
+          if (whysperAPI?.interviewAction) {
+            const state = await whysperAPI.getInterviewState();
+            await whysperAPI.interviewAction(['starting', 'listening', 'recovering'].includes(state.captureState) ? 'pause' : 'start');
+            return;
+          }
           if (!isInteractive) {
             addMessage('Window is in non-interactive mode. Press Alt+A to enable interaction.', 'error');
             return;
@@ -1245,6 +1282,12 @@
       if (sendButton) {
         sendButton.addEventListener('click', async () => {
           const text = messageInput.value.trim();
+          if (text && whysperAPI?.interviewAction) {
+            const result = await whysperAPI.interviewAction('submit', { text });
+            if (result?.error) addMessage(result.error, 'error');
+            else { messageInput.value = ''; autoGrow(messageInput); }
+            return;
+          }
           if (text) {
             addMessage(text, 'user');
             messageInput.value = '';
@@ -1283,6 +1326,7 @@
         messageInput.addEventListener('keydown', async (e) => {
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
+            if (whysperAPI?.interviewAction) { sendButton.click(); return; }
             const text = messageInput.value.trim();
             if (text) {
               addMessage(text, 'user');
@@ -1311,10 +1355,6 @@
         }
       });
 
-      // Initialize
-      if (!chatHistory || chatHistory.length === 0) {
-        addMessage('Recording in Progress. press Alt+R to stop recording.', 'system');
-      }
     </script>
   </body>
 </html>

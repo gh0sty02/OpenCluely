@@ -497,6 +497,7 @@ class ChatWindowUI {
     }
 
     formatMarkdown(text) {
+        if (window.InterviewUI) return window.InterviewUI.renderMarkdown(text);
         if (!text) return '';
         
         try {
