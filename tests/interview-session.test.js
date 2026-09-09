@@ -111,6 +111,61 @@ test('a two-second planning pause remains one automatically submitted question',
     'Explain how transformers work and how they are trained');
 });
 
+test('two questions separated by a full silence deadline are auto-submitted as two independent turns', async () => {
+  // Covers the turn-detection acceptance doc's "Separate question" row
+  // (docs/testing/turn-detection-acceptance.md): a pause past the full
+  // silence window with no further speech, followed by a second,
+  // independent turn, must produce two separate auto-submitted questions —
+  // not the same question resubmitted, and not one turn absorbing the other.
+  const clock = createClock(1000);
+  const generationCalls = [];
+  const controller = new SessionController({
+    generate: (question, options) => {
+      const call = { question, options };
+      generationCalls.push(call);
+      return new Promise((resolve) => { call.resolve = resolve; });
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer
+  });
+  controller.startSession({ source: 'system' });
+  controller.setAutoAnswer(true, 3000);
+  controller.beginCapture(7);
+  const settleTranscript = (text, utteranceId, speechEndedAt) => {
+    controller.noteSpeechEnded({ captureId: 7, utteranceId, speechEndedAt });
+    controller.noteTranscriptionStarted({ captureId: 7, utteranceId, speechEndedAt });
+    controller.acceptTranscript({
+      sessionId: controller.sessionId, captureId: 7, source: 'system', final: true,
+      utteranceId, speechEndedAt, text
+    });
+    controller.noteTranscriptionSettled({ captureId: 7, utteranceId, speechEndedAt, text, errorCode: null });
+  };
+
+  // First turn: speech ends at t=1000, no further speech; the full 3000ms
+  // silence window elapses and auto-submits exactly one question.
+  settleTranscript('Explain hash maps', 'u1', 1000);
+  clock.advance(3000);
+  assert.equal(generationCalls.length, 1);
+  assert.equal(generationCalls[0].question.text, 'Explain hash maps');
+  assert.equal(controller.snapshot().turnState, 'idle');
+
+  // Resolve the first answer so the controller's single active-generation
+  // slot frees up before the second turn tries to reach generate().
+  generationCalls[0].resolve({ response: 'A hash map is a key-value store.' });
+  await new Promise(resolve => setImmediate(resolve));
+
+  // Second, fully independent turn: its own speech end and a fresh silence
+  // deadline measured from that speech end, well past the first turn's
+  // deadline (t=1000+3000=4000). Must produce a second, distinct question —
+  // not a duplicate of the first and not silently dropped.
+  settleTranscript('And explain binary search trees', 'u2', clock.now());
+  clock.advance(3000);
+  assert.equal(generationCalls.length, 2);
+  assert.equal(generationCalls[1].question.text, 'And explain binary search trees');
+  assert.notEqual(generationCalls[1].question.id, generationCalls[0].question.id);
+});
+
 test('stale, failed, and duplicate lifecycle events do not change the current turn', () => {
   const { controller, settleTranscript } = setupTurnLifecycle();
   settleTranscript('Explain queues', 'u1', 1000);
@@ -386,6 +441,41 @@ test('latency metrics: a spoken turn records transcription, endpoint wait, first
   assert.equal(summary.endpointWaitMs.p50, 2700);
   assert.equal(summary.firstTokenMs.p50, 500);
   assert.equal(summary.totalMs.p50, 4200);
+});
+
+test('latency metrics: transcriptReadyAt survives a settle that synchronously commits the turn', async () => {
+  const { clock, controller, calls, metrics } = setupTurnLifecycleWithMetrics();
+  controller.noteSpeechEnded({ captureId: 7, utteranceId: 'u1', speechEndedAt: 1000 });
+  controller.noteTranscriptionStarted({ captureId: 7, utteranceId: 'u1', speechEndedAt: 1000 });
+  // Transcription outlives the full 3000ms silence window: by the time it
+  // settles, the deadline (1000 + 3000 = 4000) has already passed. This
+  // drives TurnDetector._scheduleIfEligible() to compute delay === 0 and
+  // call _tryReady() *synchronously* inside noteTranscriptionSettled(), so
+  // 'ready' -> _commitReadyTurn -> answerNow() -> submit() all run before
+  // control returns to the session controller's own noteTranscriptionSettled()
+  // call below — exactly the case that used to leave transcriptReadyAt (and
+  // therefore transcriptionMs/endpointWaitMs) null.
+  clock.advance(3200);
+  controller.acceptTranscript({
+    sessionId: controller.sessionId, captureId: 7, source: 'system', final: true,
+    utteranceId: 'u1', speechEndedAt: 1000, text: 'Explain memoization'
+  });
+  controller.noteTranscriptionSettled({
+    captureId: 7, utteranceId: 'u1', speechEndedAt: 1000, text: 'Explain memoization', errorCode: null
+  });
+
+  // The turn was submitted synchronously by the settle call above.
+  assert.equal(calls.length, 1);
+  calls[0].options.onDelta('Memoization is');
+  calls[0].resolve({ response: 'Memoization is caching results.' });
+  await new Promise(resolve => setImmediate(resolve));
+
+  const summary = metrics.getSummary();
+  assert.equal(summary.count, 1);
+  assert.equal(summary.transcriptionMs.count, 1);
+  assert.equal(summary.transcriptionMs.p50, 3200);
+  assert.equal(summary.endpointWaitMs.count, 1);
+  assert.equal(summary.endpointWaitMs.p50, 0);
 });
 
 test('latency metrics: a typed question has no acoustic stages but still records commitment onward', async () => {

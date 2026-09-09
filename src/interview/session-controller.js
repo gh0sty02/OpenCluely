@@ -106,15 +106,26 @@ class SessionController extends EventEmitter {
   }
   noteTranscriptionStarted(event) { this.turnDetector.noteTranscriptionStarted(event); }
   noteTranscriptionSettled(event) {
-    const pendingBefore = this.turnDetector.snapshot().pendingTranscriptions;
-    this.turnDetector.noteTranscriptionSettled(event);
-    const after = this.turnDetector.snapshot();
+    const before = this.turnDetector.snapshot();
     // Content-free latency mark: the moment the *last* pending transcription
     // job settles (not every settle, only the transition to zero pending
     // while nobody is speaking) is "transcript ready" for this turn.
-    if (pendingBefore > 0 && after.pendingTranscriptions === 0 && !after.speakerActive) {
+    //
+    // This must be stamped BEFORE delegating to the turn detector below.
+    // When transcription outlives the silence window, the detector's
+    // _scheduleIfEligible() computes a zero delay and calls _tryReady()
+    // synchronously inside noteTranscriptionSettled() itself, which emits
+    // 'ready' -> _commitReadyTurn -> answerNow() -> submit(), all before
+    // control returns here. submit() reads _pendingTranscriptReadyAt (and
+    // nulls it) as part of that same synchronous call, so setting the mark
+    // afterward — as this used to — would write into a slot no question
+    // will ever read again, and transcriptionMs/endpointWaitMs would come
+    // back null exactly on the slow-transcription turns latency metrics
+    // exist to measure.
+    if (before.pendingTranscriptions === 1 && !before.speakerActive) {
       this._pendingTranscriptReadyAt = this.now();
     }
+    this.turnDetector.noteTranscriptionSettled(event);
   }
 
   startSession({ source = this.source, mode = this.mode } = {}) {
