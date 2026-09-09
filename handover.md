@@ -1,6 +1,7 @@
 # OpenCluely implementation handover
 
 Read [progress.md](progress.md), the [plan](docs/superpowers/plans/2026-09-08-interview-assistant.md), and the [design](docs/superpowers/specs/2026-09-08-interview-assistant-design.md) first.
+Then read the [turn detection and visible answers plan](docs/superpowers/plans/2026-09-09-turn-detection-and-visible-answers.md) for the next implementation milestone.
 The user authorized implementation and requested these handover documents for another agent to continue from the current point.
 
 ## User requirements
@@ -47,6 +48,11 @@ Audio: `src/audio/capture.js` (renderer, `AudioCapture` class) + `src/audio/pcm-
 If continuing in a fresh session: reuse the CDP approach if Playwright isn't installed — `npm.cmd start -- --remote-debugging-port=9222` in the background, `curl http://localhost:9222/json` to list window targets, then open a raw `WebSocket` (Node 22+ has it built in) to a target's `webSocketDebuggerUrl` and send `Runtime.evaluate`/`Page.captureScreenshot` CDP commands. **Always `taskkill //F //IM electron.exe //T` before relaunching** — this app has a single-instance lock, so a stale running instance will just focus itself and your new process will exit immediately without loading your code changes (this cost real time in this session before being caught).
 
 ## Continuation
+
+The detailed next plan is written but no implementation from it has started.
+Execute it in order because speech lifecycle events and the turn detector are prerequisites for UI and acceptance work.
+The unresolved timing race occurs when new speech begins before the previous segment finishes transcription, because cancelling a timer does not record activity when no timer exists yet.
+The visible-answer path needs a stateful leading-reasoning filter because safe HTML escaping currently displays `<think>`-style tags as text.
 
 Next, in priority order: (1) screenshot-verify chat.html and settings.html similarly, since chat.html's interview panel uses the same shared CSS/JS and could have its own undiscovered issues; (2) test the microphone source path; (3) exercise retry/stop-answer/multi-question queueing live; (4) add the "reject settings changes mid-session" guard from the plan; (5) decide whether to migrate the legacy `process*Stream` methods onto `sse-parser` too, or leave them (they still work, just don't get the deadline/retry hardening); (6) task 7's fuller settings/diagnostics audit; (7) task 8 (corpus, perf, packaging).
 

@@ -2,12 +2,16 @@
 
 Plan: [Reliable interview assistant](docs/superpowers/plans/2026-09-08-interview-assistant.md).
 Design: [Interview assistant design](docs/superpowers/specs/2026-09-08-interview-assistant-design.md).
+Next plan: [Turn detection and visible answers](docs/superpowers/plans/2026-09-09-turn-detection-and-visible-answers.md).
 
 ## Current objective
 
 Implement the approved plan in the existing working tree, preserving the user's custom-provider work.
 System audio is the confirmed default, with microphone optional.
 Windows is the initial validation target.
+
+The next milestone is planned but not implemented.
+It will make automatic answering the missing-value default, join natural two-second pauses through an acoustic turn detector and transcription drain barrier, filter hidden reasoning before storage or rendering, and measure latency by stage.
 
 ## Decisions
 
