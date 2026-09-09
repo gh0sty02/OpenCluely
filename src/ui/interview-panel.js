@@ -55,7 +55,7 @@
             <meter id="interviewLevel" min="0" max="1" value="0" aria-label="Audio input level"></meter>
             ${panel ? '<button class="interview-button" data-action="end">End session</button><button class="interview-button" data-action="settings">Settings</button>' : ''}
         </div>
-        <div class="interview-status" role="status"><span id="captureStatus">Audio off</span><span id="answerStatus">Ready for a question</span></div>
+        <div class="interview-status" role="status"><span id="captureStatus">Audio off</span><span id="turnStatus" hidden></span><span id="answerStatus">Ready for a question</span></div>
         ${panel ? `<div class="interview-mode-row"><label for="interviewMode">Answer style</label><select id="interviewMode"><option value="interview">Auto interview</option><option value="general">General</option><option value="system-design">System design</option><option value="dsa">Coding</option><option value="behavioral">Behavioral</option><option value="code-explanation">Code explanation</option><option value="aptitude">Aptitude</option></select></div>
         <p class="interview-notice" id="interviewNotice" role="alert" hidden></p>
         <section class="interview-question"><h2>Your question</h2><p id="interviewQuestion">Start listening to capture a question, or type one below.</p><textarea id="interviewEdit" aria-label="Edit question" rows="3" hidden></textarea><div class="interview-actions"><button class="interview-button" data-action="answer-now" disabled>Answer now</button><button class="interview-button" data-action="edit" disabled>Edit question</button><button class="interview-button" data-action="retry" disabled>Retry answer</button><button class="interview-button" data-action="stop-answer" disabled>Stop answer</button></div></section>
@@ -128,6 +128,13 @@
         const state = ui.viewState(snapshot);
         find('captureStatus').textContent = state.captureLabel;
         find('captureStatus').dataset.state = snapshot.captureState || 'idle';
+        // The turn indicator only means something while capture is actually
+        // running; hide it the rest of the time instead of echoing "Ready for
+        // a question" next to an already-explicit "Audio off" capture label.
+        const turnStatus = find('turnStatus');
+        turnStatus.textContent = state.turnLabel;
+        turnStatus.dataset.state = snapshot.turnState || 'idle';
+        turnStatus.hidden = !state.captureActive;
         find('answerStatus').textContent = state.answerLabel + (snapshot.queueLength ? ` (${snapshot.queueLength} waiting)` : '');
         find('interviewLevel').value = state.level;
         find('interviewSource').value = snapshot.source || 'system';

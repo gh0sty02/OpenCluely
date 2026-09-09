@@ -41,11 +41,26 @@
         const current = active || questions[questions.length - 1] || null;
         const source = snapshot.source === 'microphone' ? 'microphone' : 'system audio';
         const labels = { idle: 'Audio off', starting: 'Preparing audio', listening: `Listening to ${source}`, paused: 'Capture paused', recovering: 'Reconnecting audio', error: 'Audio needs attention' };
-        const answerLabels = { queued: 'Question queued', generating: 'Writing answer', completed: 'Answer ready', cancelled: 'Answer stopped', error: 'Answer needs attention', overflow: 'Queue full - submit when ready' };
+        // The acoustic turn detector's own phases (src/interview/turn-detector.js
+        // TURN_STATES), told independently of captureLabel above: capture can be
+        // "listening" for a long time while the turn itself moves through
+        // speaking / transcribing / waiting / ready. No countdown is derived
+        // from turnDeadlineAt here on purpose; see Step 3 of the task brief.
+        const turnLabels = { idle: 'Ready for a question', speaking: 'Listening to the interviewer', transcribing: 'Transcribing question', waiting: 'Waiting for the rest of the question', ready: 'Question captured' };
+        const answerLabels = { queued: 'Question queued', completed: 'Answer ready', cancelled: 'Answer stopped', error: 'Answer needs attention', overflow: 'Queue full - submit when ready' };
+        // A generating question has no visible answer until its provider's
+        // first non-hidden token arrives (VisibleAnswerFilter has already
+        // stripped leading reasoning tags by the time text reaches `answer`),
+        // so "Preparing" versus "Writing" is decided by whether any visible
+        // text has landed yet, not by the request having started.
+        const answerLabel = current
+            ? (current.state === 'generating' ? (current.answer ? 'Writing answer' : 'Preparing answer') : answerLabels[current.state] || 'Ready for a question')
+            : 'Ready for a question';
         return {
             current,
             captureLabel: labels[snapshot.captureState] || labels.idle,
-            answerLabel: current ? answerLabels[current.state] || 'Ready for a question' : 'Ready for a question',
+            turnLabel: turnLabels[snapshot.turnState] || turnLabels.idle,
+            answerLabel,
             captureActive: ['starting', 'listening', 'recovering'].includes(snapshot.captureState),
             canAnswer: Boolean(snapshot.draft?.trim()),
             canStop: current?.state === 'generating',

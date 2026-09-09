@@ -669,6 +669,12 @@ body.interview-shell {
 #captureStatus::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 7px; background: #758299; }
 #captureStatus[data-state="listening"]::before { background: #92c7b6; }
 #captureStatus[data-state="error"]::before { background: #f0a5a5; }
+/* Turn status: the acoustic turn detector's own phase, shown alongside
+   captureStatus only while capture is active (see interview-panel.js). */
+#turnStatus::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 7px; background: #758299; }
+#turnStatus[data-state="speaking"]::before { background: #92c7b6; }
+#turnStatus[data-state="transcribing"]::before, #turnStatus[data-state="waiting"]::before { background: #e0c169; }
+#turnStatus[data-state="ready"]::before { background: #92c7b6; }
 .interview-mode-row { display: flex; align-items: center; gap: 12px; padding: 14px 0 18px; color: var(--ink-muted); font-size: 12px; border-bottom: 1px solid var(--line); }
 .interview-question { margin-top: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
 .interview-question h2 { font-size: 12px; color: var(--ink-muted); font-weight: 500; margin: 0 0 6px; }
