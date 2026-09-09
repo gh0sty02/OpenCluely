@@ -42,7 +42,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setGeminiApiKey: (apiKey) => ipcRenderer.invoke('set-gemini-api-key', apiKey),
   getGeminiStatus: () => ipcRenderer.invoke('get-gemini-status'),
   testGeminiConnection: () => ipcRenderer.invoke('test-gemini-connection'),
-  
+  // Same channel: 'test-gemini-connection' calls llmService.testConnection(),
+  // and llmService is whichever provider llm.factory.js selected (Gemini or
+  // OpenRouter) — the name predates OpenRouter support. The settings window's
+  // provider-agnostic "Test AI connection" button uses this alias.
+  testLlmConnection: () => ipcRenderer.invoke('test-gemini-connection'),
+
   // Settings
   showSettings: () => ipcRenderer.invoke('show-settings'),
   hideSettings: () => ipcRenderer.invoke('hide-settings'),
