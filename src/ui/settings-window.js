@@ -257,32 +257,57 @@ document.addEventListener('DOMContentLoaded', () => {
         if (openrouterBaseUrlInput) openrouterBaseUrlInput.disabled = selectedProvider !== 'openrouter';
     };
 
+    // Save a single field instead of resending the whole form. The form can
+    // go stale relative to disk (the window may sit open for a while, or
+    // .env may be hand-edited while it's open) — sending every field on
+    // every blur/change meant blurring or changing ONE field silently wrote
+    // every OTHER field's stale in-memory value back over a newer edit made
+    // outside this window (e.g. hand-editing .env, or a change from another
+    // window). Only the field the user actually touched should be saved.
+    const saveField = async (key, value) => {
+        try {
+            const result = await window.electronAPI.saveSettings({ [key]: value });
+            if (result?.error) throw new Error(result.error);
+            connectionStatus.textContent = 'Settings saved. Test the connection to verify the model.';
+        } catch (error) {
+            connectionStatus.textContent = error.message || 'Settings could not be saved.';
+            requestCurrentSettings();
+        }
+    };
+
     // Add event listeners for all inputs
-    const inputs = [
-        audioSourceSelect,
-        azureKeyInput,
-        azureRegionInput,
-        whisperCommandInput,
-        whisperModelInput,
-        whisperLanguageInput,
-        whisperDeviceSelect,
-        whisperCaptureModeSelect,
-        whisperResponseTargetSelect,
-        whisperSegmentMsInput,
-        mistralKeyInput,
-        geminiKeyInput,
-        windowGapInput,
-        openrouterKeyInput,
-        openrouterModelInput,
-        openrouterBaseUrlInput
+    const fieldInputs = [
+        [audioSourceSelect, 'audioSource'],
+        [azureKeyInput, 'azureKey'],
+        [azureRegionInput, 'azureRegion'],
+        [whisperCommandInput, 'whisperCommand'],
+        [whisperModelInput, 'whisperModel'],
+        [whisperLanguageInput, 'whisperLanguage'],
+        [whisperDeviceSelect, 'whisperDevice'],
+        [whisperCaptureModeSelect, 'whisperCaptureMode'],
+        [whisperResponseTargetSelect, 'whisperResponseTarget'],
+        [whisperSegmentMsInput, 'whisperSegmentMs'],
+        [mistralKeyInput, 'mistralKey'],
+        [geminiKeyInput, 'geminiKey'],
+        [windowGapInput, 'windowGap'],
+        [openrouterKeyInput, 'openrouterKey'],
+        [openrouterModelInput, 'openrouterModel'],
+        [openrouterBaseUrlInput, 'openrouterBaseUrl']
     ];
 
-    inputs.forEach(input => {
+    fieldInputs.forEach(([input, key]) => {
         if (input) {
-            input.addEventListener('change', saveSettings);
-            input.addEventListener('blur', saveSettings);
+            const save = () => saveField(key, input.value);
+            input.addEventListener('change', save);
+            input.addEventListener('blur', save);
         }
     });
+
+    // The window can be left open in the background; refresh every field
+    // from the live settings whenever it regains focus, so a hand-edited
+    // .env (or a change made elsewhere) isn't overwritten by a stale DOM
+    // snapshot the next time any field is touched.
+    window.addEventListener('focus', requestCurrentSettings);
 
     if (speechProviderSelect) {
         speechProviderSelect.addEventListener('change', () => {
