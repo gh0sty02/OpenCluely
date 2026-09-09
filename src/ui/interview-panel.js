@@ -2,6 +2,12 @@
     'use strict';
     const api = window.electronAPI;
     const ui = window.InterviewUI;
+    const defaultSilenceMs = 3000;
+    const silencePresets = new Set([2500, 3000, 4500]);
+    const normalizeSilenceMs = value => {
+        const milliseconds = Number(value);
+        return silencePresets.has(milliseconds) ? milliseconds : defaultSilenceMs;
+    };
     if (!api?.getInterviewState || !ui) return;
 
     const panel = document.getElementById('interviewPanel');
@@ -45,7 +51,7 @@
             <button class="interview-button primary" data-action="capture">Start listening</button>
             <label class="interview-source"><span class="sr-only">Audio source</span><select id="interviewSource"><option value="system">System audio</option><option value="microphone">Microphone</option></select></label>
             <label class="interview-source"><span class="sr-only">Listening mode</span><select id="interviewAutoAnswer"><option value="manual">Manual</option><option value="auto">Automatic</option></select></label>
-            <label class="interview-source" id="interviewSilenceGapWrap"><span class="sr-only">Pause before answering</span><select id="interviewSilenceGap"><option value="1500">1.5s pause</option><option value="2500">2.5s pause</option><option value="4000">4s pause</option><option value="6000">6s pause</option></select></label>
+            <label class="interview-source" id="interviewSilenceGapWrap"><span class="sr-only">Pause before answering</span><select id="interviewSilenceGap"><option value="2500">Responsive (2.5s)</option><option value="3000">Balanced (3s)</option><option value="4500">Patient (4.5s)</option></select></label>
             <meter id="interviewLevel" min="0" max="1" value="0" aria-label="Audio input level"></meter>
             ${panel ? '<button class="interview-button" data-action="end">End session</button><button class="interview-button" data-action="settings">Settings</button>' : ''}
         </div>
@@ -104,11 +110,11 @@
     });
     find('interviewAutoAnswer').addEventListener('change', async event => {
         const enabled = event.target.value === 'auto';
-        const silenceMs = Number(find('interviewSilenceGap').value) || 2500;
+        const silenceMs = normalizeSilenceMs(find('interviewSilenceGap').value);
         await action('set-auto-answer', { enabled, silenceMs });
     });
     find('interviewSilenceGap').addEventListener('change', async event => {
-        const silenceMs = Number(event.target.value) || 2500;
+        const silenceMs = normalizeSilenceMs(event.target.value);
         await action('set-auto-answer', { enabled: true, silenceMs });
     });
     find('interviewMode')?.addEventListener('change', async event => {
@@ -127,7 +133,7 @@
         find('interviewSource').value = snapshot.source || 'system';
         find('interviewSource').disabled = state.captureActive;
         find('interviewAutoAnswer').value = snapshot.autoAnswer ? 'auto' : 'manual';
-        find('interviewSilenceGap').value = String(snapshot.autoAnswerSilenceMs || 2500);
+        find('interviewSilenceGap').value = String(normalizeSilenceMs(snapshot.autoAnswerSilenceMs));
         find('interviewSilenceGapWrap').hidden = !snapshot.autoAnswer;
         host.querySelector('[data-action="capture"]').textContent = state.captureActive ? 'Pause listening' : snapshot.captureState === 'paused' ? 'Resume listening' : 'Start listening';
         if (!panel) return;

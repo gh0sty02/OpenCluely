@@ -2,20 +2,15 @@
 const { EventEmitter } = require('events');
 const { randomUUID } = require('crypto');
 const { CAPTURE_STATES } = require('./contracts');
+const TurnDetector = require('./turn-detector');
 
-// Finalized transcripts only ever accumulate into `draft`. A draft becomes
-// a question, and generation starts, on an explicit user action —
-// pause() ("Stop listening"), answerNow(), or a typed submit() — UNLESS
-// autoAnswer is enabled, in which case a draft also dispatches itself after
-// autoAnswerSilenceMs of no new speech (a wide gap by default, wide enough
-// that a normal mid-sentence pause doesn't trigger a premature answer).
-// Finishing an answer may drain other already-queued questions, never the draft.
+// Finalized transcripts accumulate into `draft`. Explicit actions submit the
+// draft immediately. Automatic submission waits for the acoustic detector to
+// observe drained transcription work and a complete silence window.
 class SessionController extends EventEmitter {
-  constructor({ generate, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  constructor({ generate, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
     super();
     this.generate = generate;
-    this.setTimer = setTimer;
-    this.clearTimer = clearTimer;
     this.source = 'system';
     this.mode = 'interview';
     this.sessionId = randomUUID();
@@ -29,15 +24,28 @@ class SessionController extends EventEmitter {
     this.level = 0;
     this.statusMessage = '';
     this.autoAnswer = false;
-    this.autoAnswerSilenceMs = 2500;
-    this.timer = null;
+    this.autoAnswerSilenceMs = 3000;
+    this.activeCaptureId = null;
+    this.turnDetector = new TurnDetector({
+      silenceMs: this.autoAnswerSilenceMs,
+      now,
+      setTimer,
+      clearTimer
+    });
+    this.turnDetector.on('state', () => this.publish());
+    this.turnDetector.on('ready', event => this._commitReadyTurn(event));
+    this.turnDetector.on('warning', warning => this.emit('warning', warning));
   }
 
   snapshot() {
+    const turn = this.turnDetector.snapshot();
     return { sessionId: this.sessionId, captureState: this.captureState, source: this.source,
       mode: this.mode, level: this.level, draft: this.draft, statusMessage: this.statusMessage,
       questions: this.questions.map(q => ({ ...q })), activeQuestionId: this.active?.question.id || null,
-      queueLength: this.queue.length, autoAnswer: this.autoAnswer, autoAnswerSilenceMs: this.autoAnswerSilenceMs };
+      queueLength: this.queue.length, autoAnswer: this.autoAnswer, autoAnswerSilenceMs: this.autoAnswerSilenceMs,
+      turnState: turn.turnState, turnDeadlineAt: turn.turnDeadlineAt,
+      pendingTranscriptions: turn.pendingTranscriptions,
+      hasVisibleAnswer: this.questions.some(question => Boolean(question.answer && question.answer.trim())) };
   }
 
   publish() { this.emit('state', this.snapshot()); }
@@ -52,17 +60,22 @@ class SessionController extends EventEmitter {
   setMode(mode) { this.mode = mode; this.publish(); }
   setAutoAnswer(enabled, silenceMs) {
     this.autoAnswer = Boolean(enabled);
-    if (Number.isFinite(silenceMs) && silenceMs > 0) this.autoAnswerSilenceMs = silenceMs;
-    if (!this.autoAnswer) this._cancelTimer();
+    if (Number.isFinite(silenceMs) && silenceMs > 0) {
+      this.autoAnswerSilenceMs = silenceMs;
+      this.turnDetector.silenceMs = silenceMs;
+    }
+    if (!this.autoAnswer) this._resetTurnDetector();
     this.publish();
   }
-  // Real-time VAD speech-onset signal (fires the instant new audio starts,
-  // independent of transcription latency) — hold off a pending auto-answer
-  // the moment the speaker resumes, so a slow transcription of the next
-  // fragment can never race a stale deadline into firing early.
-  noteActivity() {
-    if (this.autoAnswer) this._cancelTimer();
+  beginCapture(captureId) {
+    if (!Number.isFinite(captureId)) return;
+    this.activeCaptureId = captureId;
+    this.turnDetector.begin({ sessionId: this.sessionId, captureId });
   }
+  noteSpeechStarted(event) { this.turnDetector.noteSpeechStarted(event); }
+  noteSpeechEnded(event) { this.turnDetector.noteSpeechEnded(event); }
+  noteTranscriptionStarted(event) { this.turnDetector.noteTranscriptionStarted(event); }
+  noteTranscriptionSettled(event) { this.turnDetector.noteTranscriptionSettled(event); }
 
   startSession({ source = this.source, mode = this.mode } = {}) {
     this.clearSession();
@@ -71,10 +84,16 @@ class SessionController extends EventEmitter {
     this.setCaptureState('starting');
     return this.sessionId;
   }
-  pause() { this.setCaptureState('paused'); this.answerNow(); }
+  pause() {
+    this.setCaptureState('paused');
+    this.activeCaptureId = null;
+    this.turnDetector.cancel();
+    this.answerNow();
+  }
   resume() { this.setCaptureState('starting'); }
   endSession() {
-    this._cancelTimer();
+    this.activeCaptureId = null;
+    this.turnDetector.cancel();
     this._cancelActive();
     this.queue.forEach(q => { q.state = 'cancelled'; });
     this.queue = [];
@@ -91,6 +110,7 @@ class SessionController extends EventEmitter {
 
   acceptTranscript(event) {
     if (!event || event.sessionId !== this.sessionId || !event.final || !event.utteranceId) return;
+    if (Number.isFinite(event.captureId) && event.captureId !== this.activeCaptureId) return;
     const identity = `${event.source}:${event.utteranceId}`;
     if (this.seen.has(identity)) return;
     this.seen.add(identity);
@@ -99,27 +119,20 @@ class SessionController extends EventEmitter {
     if (!text || /^(\[.*\]|\(.*\)|um|uh|hmm|hm|ah)[.!?]*$/i.test(text)) return;
     this.draft = this.draft ? `${this.draft} ${text}` : text;
     this.draftSource = event.source || this.source;
-    this._cancelTimer();
-    // Microphone transcripts stay context-only in auto mode too — only
-    // system/call audio (the actual interview question) auto-dispatches.
-    if (this.autoAnswer && this.draftSource !== 'microphone') {
-      // Count the gap from when the speaker actually fell silent
-      // (event.speechEndedAt, captured by VAD before transcription work
-      // starts), not from when this transcript happened to arrive — a slow
-      // Whisper pass must never eat into the configured pause budget.
-      const elapsed = Number.isFinite(event.speechEndedAt) ? Date.now() - event.speechEndedAt : 0;
-      const remaining = Math.max(0, this.autoAnswerSilenceMs - elapsed);
-      this.timer = this.setTimer(() => { this.timer = null; this.answerNow(); }, remaining);
-    }
     this.publish();
   }
 
   answerNow(text) {
-    this._cancelTimer();
+    this.turnDetector.cancel();
     const question = typeof text === 'string' ? text.trim() : this.draft.trim();
-    if (!question) return;
+    if (!question) {
+      this._resumeTurnDetection();
+      return;
+    }
     this.draft = '';
-    return this.submit(question, this.draftSource);
+    const questionId = this.submit(question, this.draftSource);
+    this._resumeTurnDetection();
+    return questionId;
   }
   submit(text, source = 'typed') {
     if (typeof text !== 'string' || !text.trim()) throw new Error('Enter a question first.');
@@ -157,7 +170,19 @@ class SessionController extends EventEmitter {
     }
     this.publish(); this._pump();
   }
-  _cancelTimer() { if (this.timer !== null) this.clearTimer(this.timer); this.timer = null; }
+  _commitReadyTurn(event) {
+    if (!this.autoAnswer || this.source === 'microphone') return;
+    if (event.sessionId !== this.sessionId || event.captureId !== this.activeCaptureId || !this.draft.trim()) return;
+    this.answerNow();
+  }
+  _resetTurnDetector() {
+    this.turnDetector.cancel();
+    this._resumeTurnDetection();
+  }
+  _resumeTurnDetection() {
+    if (this.activeCaptureId === null || !['starting', 'listening', 'recovering'].includes(this.captureState)) return;
+    this.turnDetector.begin({ sessionId: this.sessionId, captureId: this.activeCaptureId });
+  }
   _cancelActive() {
     if (!this.active) return;
     const active = this.active;
