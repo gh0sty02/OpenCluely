@@ -5,6 +5,18 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { SSEParser, streamCompletion, openAIEvent, geminiEvent } = require('../src/services/sse-parser');
 
+const loggerPath = require.resolve('../src/core/logger');
+require.cache[loggerPath] = {
+  id: loggerPath,
+  filename: loggerPath,
+  loaded: true,
+  exports: {
+    createServiceLogger: () => ({
+      debug() {}, info() {}, warn() {}, error() {}, logPerformance() {}
+    })
+  }
+};
+
 const event = (text, reason = null) => `data: ${JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: reason }] })}\r\n\r\n`;
 
 async function fixture(t, handler) {
@@ -166,4 +178,119 @@ test('Gemini completion and safety markers have explicit semantics', () => {
   assert.deepEqual(geminiEvent(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Answer' }, { thought: true, text: 'private reasoning' }] }, finishReason: 'STOP' }] })), { delta: 'Answer', done: true, finishReason: 'STOP' });
   assert.throws(() => geminiEvent('{"promptFeedback":{"blockReason":"SAFETY"}}'), { code: 'CONTENT_BLOCKED' });
   assert.throws(() => geminiEvent('{bad'), { code: 'MALFORMED_RESPONSE' });
+});
+
+test('provider event mappers ignore structured reasoning fields', () => {
+  assert.equal(openAIEvent(JSON.stringify({ choices: [{ delta: {
+    reasoning: 'private',
+    reasoning_content: 'private chain',
+    content: 'Visible'
+  } }] })).delta, 'Visible');
+  assert.equal(geminiEvent(JSON.stringify({ candidates: [{ content: { parts: [
+    { thought: true, text: 'private' },
+    { text: 'Visible' }
+  ] } }] })).delta, 'Visible');
+});
+
+function stubService(t, service, replacements) {
+  const originals = new Map();
+  for (const [name, value] of Object.entries(replacements)) {
+    originals.set(name, service[name]);
+    service[name] = value;
+  }
+  const initialized = service.isInitialized;
+  service.isInitialized = true;
+  t.after(() => {
+    service.isInitialized = initialized;
+    for (const [name, value] of originals) service[name] = value;
+  });
+}
+
+test('OpenRouter legacy stream entry points delegate to visible answer generation', async t => {
+  const service = require('../src/services/openrouter.service');
+  const calls = [];
+  const deltas = [];
+  stubService(t, service, {
+    generateAnswer: async options => {
+      calls.push(options);
+      options.onDelta('Visible');
+      return { text: 'Visible', finishReason: 'stop', timing: {} };
+    },
+    _executeStreamingRequest: () => { throw new Error('duplicate parser used'); }
+  });
+
+  const text = await service.processTextWithSkillStream('typed', 'general', [], null, delta => deltas.push(delta));
+  const speech = await service.processTranscriptionWithIntelligentResponseStream('spoken', 'general', [], null, delta => deltas.push(delta));
+  const image = await service.processImageWithSkillStream(Buffer.from('image'), 'image/png', 'dsa', [], 'cpp', delta => deltas.push(delta));
+
+  assert.deepEqual([text.response, speech.response, image.response], ['Visible', 'Visible', 'Visible']);
+  assert.deepEqual(deltas, ['Visible', 'Visible', 'Visible']);
+  assert.equal(calls.length, 3);
+  const imageContent = calls[2].messages.at(-1).content;
+  assert.equal(imageContent[0].type, 'image_url');
+  assert.match(imageContent[0].image_url.url, /^data:image\/png;base64,/);
+  assert.equal(imageContent[1].type, 'text');
+});
+
+test('Gemini legacy stream entry points delegate without losing image parts', async t => {
+  const service = require('../src/services/llm.service');
+  const calls = [];
+  const deltas = [];
+  stubService(t, service, {
+    generateAnswer: async options => {
+      calls.push(options);
+      options.onDelta('Visible');
+      return { text: 'Visible', finishReason: 'STOP', timing: {} };
+    },
+    executeStreamingRequest: () => { throw new Error('duplicate parser used'); }
+  });
+
+  const text = await service.processTextWithSkillStream('typed', 'general', [], null, delta => deltas.push(delta));
+  const speech = await service.processTranscriptionWithIntelligentResponseStream('spoken', 'general', [], null, delta => deltas.push(delta));
+  const image = await service.processImageWithSkillStream(Buffer.from('image'), 'image/png', 'dsa', [], 'cpp', delta => deltas.push(delta));
+
+  assert.deepEqual([text.response, speech.response, image.response], ['Visible', 'Visible', 'Visible']);
+  assert.deepEqual(deltas, ['Visible', 'Visible', 'Visible']);
+  assert.equal(calls.length, 3);
+  const imageContent = calls[2].messages.at(-1).content;
+  assert.equal(imageContent[0].type, 'text');
+  assert.equal(imageContent[1].type, 'image_url');
+  assert.match(imageContent[1].image_url.url, /^data:image\/png;base64,/);
+  const converted = service._messagesToGeminiRequest(calls[2].messages);
+  assert.equal(converted.contents.at(-1).parts[0].text, imageContent[0].text);
+  assert.deepEqual(converted.contents.at(-1).parts[1].inlineData, {
+    mimeType: 'image/png',
+    data: Buffer.from('image').toString('base64')
+  });
+});
+
+test('non-streaming provider fallbacks return visible text only', async t => {
+  const openrouter = require('../src/services/openrouter.service');
+  const gemini = require('../src/services/llm.service');
+  stubService(t, openrouter, {
+    generateAnswer: async () => { throw new Error('stream failed'); },
+    _executeRequest: async () => '<think>private chain</think>Visible fallback'
+  });
+  stubService(t, gemini, {
+    generateAnswer: async () => { throw new Error('stream failed'); },
+    executeRequest: async () => '<analysis>private chain</analysis>Visible fallback',
+    executeAlternativeRequest: async () => '<analysis>private chain</analysis>Visible fallback'
+  });
+
+  const openrouterResult = await openrouter.processTextWithSkillStream('typed', 'general');
+  const geminiResult = await gemini.processTextWithSkillStream('typed', 'general');
+  assert.equal(openrouterResult.response, 'Visible fallback');
+  assert.equal(geminiResult.response, 'Visible fallback');
+});
+
+test('Gemini non-streaming extraction excludes thought parts and response text shortcuts', () => {
+  const service = require('../src/services/llm.service');
+  const result = service.extractTextFromCandidates({
+    text: 'private chainVisible',
+    candidates: [{
+      finishReason: 'STOP',
+      content: { parts: [{ thought: true, text: 'private chain' }, { text: 'Visible' }] }
+    }]
+  });
+  assert.equal(result.text, 'Visible');
 });

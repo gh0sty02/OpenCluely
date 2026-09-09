@@ -1252,6 +1252,8 @@ class ApplicationController {
         skill: this.activeSkill
       });
 
+      // The provider keeps its multimodal message shape and delegates this
+      // positional entry point to the shared visible-answer stream.
       const llmResult = await llmService.processImageWithSkillStream(
         capture.imageBuffer,
         capture.mimeType || 'image/png',
@@ -1319,6 +1321,8 @@ class ApplicationController {
       });
       windowManager.showLLMLoading();
 
+      // The provider builds the skill and history messages, then uses the
+      // same visible-answer stream as interview generation.
       const llmResult = await llmService.processTextWithSkillStream(
         text,
         this.activeSkill,
@@ -1531,6 +1535,8 @@ class ApplicationController {
       if (this.shouldShowVoiceOverlay()) {
         windowManager.showLLMLoading();
       }
+      // Speech retains its focused prompt while sharing the visible-answer
+      // stream used by typed, screenshot, and interview requests.
       const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
         this.activeSkill,

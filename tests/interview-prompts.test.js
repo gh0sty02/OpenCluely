@@ -2,6 +2,19 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+
+const loggerPath = require.resolve('../src/core/logger');
+require.cache[loggerPath] = {
+  id: loggerPath,
+  filename: loggerPath,
+  loaded: true,
+  exports: {
+    createServiceLogger: () => ({
+      debug() {}, info() {}, warn() {}, error() {}, logPerformance() {}
+    })
+  }
+};
+
 const { promptLoader } = require('../prompt-loader');
 
 test('default interview policy covers question structures and does not invent a biography', () => {
@@ -42,4 +55,32 @@ test('history stays within input budget and oversized current questions fail vis
 test('new and existing modes remain available', () => {
   const skills = promptLoader.getAvailableSkills();
   for (const skill of ['interview', 'general', 'behavioral', 'dsa', 'programming', 'system-design', 'code-explanation', 'aptitude']) assert.ok(skills.includes(skill));
+});
+
+test('visible provider answers enter session history without hidden reasoning', async t => {
+  const service = require('../src/services/openrouter.service');
+  const sessionManager = require('../src/managers/session.manager');
+  const originalGenerateAnswer = service.generateAnswer;
+  const originalInitialized = service.isInitialized;
+  const originalMemory = sessionManager.sessionMemory;
+  service.isInitialized = true;
+  service.generateAnswer = async ({ onDelta }) => {
+    onDelta('Visible answer');
+    return { text: 'Visible answer', finishReason: 'stop', timing: {} };
+  };
+  sessionManager.sessionMemory = [];
+  t.after(() => {
+    service.generateAnswer = originalGenerateAnswer;
+    service.isInitialized = originalInitialized;
+    sessionManager.sessionMemory = originalMemory;
+  });
+
+  const result = await service.processTranscriptionWithIntelligentResponseStream(
+    'How does attention work?', 'interview', [], null, () => {}
+  );
+  sessionManager.addModelResponse(result.response);
+
+  assert.equal(sessionManager.getConversationHistory(10)
+    .some(event => /<think>|private chain/i.test(event.content)), false);
+  assert.equal(sessionManager.getConversationHistory(10).at(-1).content, 'Visible answer');
 });

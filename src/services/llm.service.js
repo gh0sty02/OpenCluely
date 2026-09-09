@@ -8,6 +8,7 @@ const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
 const { streamCompletion, geminiEvent } = require('./sse-parser');
+const VisibleAnswerFilter = require('./visible-answer-filter');
 
 class LLMService {
   constructor() {
@@ -80,14 +81,7 @@ class LLMService {
   generateAnswer({ messages, signal, onDelta } = {}) {
     if (!this.isInitialized) throw new Error('Gemini service not initialized. Check GEMINI_API_KEY configuration.');
     const apiKey = config.getApiKey('GEMINI');
-    const systemMessage = messages.find(message => message.role === 'system');
-    const contents = messages
-      .filter(message => message.role !== 'system')
-      .map(message => ({ role: message.role === 'assistant' ? 'model' : 'user', parts: [{ text: message.content }] }));
-    const geminiRequest = this.applyGenerationDefaults({
-      contents,
-      ...(systemMessage ? { systemInstruction: { parts: [{ text: systemMessage.content }] } } : {})
-    });
+    const geminiRequest = this.applyGenerationDefaults(this._messagesToGeminiRequest(messages));
     const body = JSON.stringify(geminiRequest);
     const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${this.model}:streamGenerateContent?alt=sse`);
     const requestOptions = {
@@ -111,16 +105,63 @@ class LLMService {
     });
   }
 
-  extractTextFromCandidates(response) {
-    // New @google/genai SDK exposes response.text as a convenience getter.
-    if (response && typeof response.text === 'string' && response.text.trim().length > 0) {
-      return {
-        text: response.text.trim(),
-        candidate: response.candidates?.[0] || null,
-        finishReason: response.candidates?.[0]?.finishReason || null
-      };
-    }
+  _messagesToGeminiRequest(messages = []) {
+    const systemMessage = messages.find(message => message.role === 'system');
+    return {
+      contents: messages
+        .filter(message => message.role !== 'system')
+        .map(message => ({
+          role: message.role === 'assistant' || message.role === 'model' ? 'model' : 'user',
+          parts: this._contentToGeminiParts(message.content)
+        })),
+      ...(systemMessage ? { systemInstruction: { parts: this._contentToGeminiParts(systemMessage.content) } } : {})
+    };
+  }
 
+  _contentToGeminiParts(content) {
+    const parts = Array.isArray(content) ? content : [{ type: 'text', text: content }];
+    return parts.map(part => {
+      if (part && part.inlineData) return { inlineData: part.inlineData };
+      if (part && (part.type === 'text' || (!part.type && typeof part.text === 'string'))) {
+        return { text: part.text };
+      }
+      if (part && part.type === 'image_url' && typeof part.image_url?.url === 'string') {
+        const match = part.image_url.url.match(/^data:([^;,]+);base64,(.+)$/s);
+        if (match) return { inlineData: { mimeType: match[1], data: match[2] } };
+      }
+      throw new Error('Unsupported Gemini message content.');
+    });
+  }
+
+  _messagesFromGeminiRequest(request) {
+    const messages = [];
+    if (request.systemInstruction?.parts?.length) {
+      messages.push({ role: 'system', content: this._geminiPartsToContent(request.systemInstruction.parts) });
+    }
+    for (const content of request.contents || []) {
+      messages.push({
+        role: content.role === 'model' ? 'assistant' : 'user',
+        content: this._geminiPartsToContent(content.parts || [])
+      });
+    }
+    return messages;
+  }
+
+  _geminiPartsToContent(parts) {
+    const content = parts.map(part => part.inlineData
+      ? { type: 'image_url', image_url: { url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` } }
+      : { type: 'text', text: part.text || '' });
+    return content.every(part => part.type === 'text')
+      ? content.map(part => part.text).join('')
+      : content;
+  }
+
+  _visibleText(text) {
+    const filter = new VisibleAnswerFilter();
+    return filter.push(text) + filter.finish();
+  }
+
+  extractTextFromCandidates(response) {
     const candidates = Array.isArray(response?.candidates)
       ? response.candidates
       : Array.isArray(response)
@@ -128,12 +169,15 @@ class LLMService {
         : [];
 
     if (!candidates.length) {
+      if (response && typeof response.text === 'string' && response.text.trim().length > 0) {
+        return { text: this._visibleText(response.text.trim()), candidate: null, finishReason: null };
+      }
       throw new Error('No candidates in Gemini response');
     }
 
     const candidateWithText = candidates.find(candidate => {
       const parts = candidate?.content?.parts;
-      return Array.isArray(parts) && parts.some(part => typeof part.text === 'string' && part.text.trim().length > 0);
+      return Array.isArray(parts) && parts.some(part => part.thought !== true && typeof part.text === 'string' && part.text.trim().length > 0);
     });
 
     if (!candidateWithText) {
@@ -142,14 +186,14 @@ class LLMService {
     }
 
     const textParts = candidateWithText.content.parts
-      .filter(part => typeof part.text === 'string' && part.text.trim().length > 0)
+      .filter(part => part.thought !== true && typeof part.text === 'string' && part.text.trim().length > 0)
       .map(part => part.text.trim());
 
     if (!textParts.length) {
       throw new Error(`Candidate parts missing text after filtering: ${JSON.stringify(candidateWithText)}`);
     }
 
-    const text = textParts.join('\n');
+    const text = this._visibleText(textParts.join('\n'));
 
     return {
       text,
@@ -234,6 +278,7 @@ class LLMService {
       }
 
       // Enforce language in code fences if provided
+      responseText = this._visibleText(responseText);
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(responseText, programmingLanguage)
         : responseText;
@@ -306,11 +351,9 @@ class LLMService {
         geminiRequest.systemInstruction = { parts: [{ text: skillPrompt }] };
       }
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const messages = this._messagesFromGeminiRequest(geminiRequest);
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -398,6 +441,7 @@ class LLMService {
       }
       
       // Enforce language in code fences if programmingLanguage specified
+      response = this._visibleText(response);
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(response, programmingLanguage)
         : response;
@@ -448,11 +492,9 @@ class LLMService {
     try {
       const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const messages = this._messagesFromGeminiRequest(geminiRequest);
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -533,6 +575,7 @@ class LLMService {
       }
       
       // Enforce language in code fences if programmingLanguage specified
+      response = this._visibleText(response);
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(response, programmingLanguage)
         : response;
@@ -1048,11 +1091,9 @@ Remember: Be intelligent about filtering - only brush off true noise/silence. Al
     try {
       const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const messages = this._messagesFromGeminiRequest(geminiRequest);
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -1086,165 +1127,6 @@ Remember: Be intelligent about filtering - only brush off true noise/silence. Al
       // single final response.
       return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage);
     }
-  }
-
-  /** Safely pull the text delta out of a streamed Gemini chunk. */
-  _extractChunkText(chunk) {
-    try {
-      const t = chunk && chunk.text;
-      if (typeof t === 'string') {
-        return t;
-      }
-    } catch (_) {
-      // `.text` getter can throw on non-text parts; fall through to manual read.
-    }
-    try {
-      const parts = (chunk && chunk.candidates && chunk.candidates[0] &&
-        chunk.candidates[0].content && chunk.candidates[0].content.parts) || [];
-      return parts.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('');
-    } catch (_) {
-      return '';
-    }
-  }
-
-  /**
-   * Run a streaming Gemini request with the same model-fallback + retry policy
-   * as executeRequest. Accumulates and returns the full text; invokes onDelta
-   * for each chunk.
-   */
-  async executeStreamingRequest(geminiRequest, onDelta) {
-    const maxRetries = config.get('llm.gemini.maxRetries');
-    const apiKey = config.getApiKey('GEMINI');
-    const primaryModel = this.model;
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
-
-    let lastError = null;
-
-    for (const modelName of modelsToTry) {
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          const fullText = await this._streamRequestForModel(geminiRequest, modelName, apiKey, onDelta);
-
-          if (!fullText) {
-            throw new Error('Empty streamed response from Gemini API');
-          }
-
-          logger.debug('Gemini streaming request successful', {
-            attempt,
-            model: modelName,
-            responseLength: fullText.length
-          });
-
-          return fullText;
-        } catch (error) {
-          const errorInfo = this.analyzeError(error);
-          lastError = error;
-
-          logger.warn(`Gemini streaming attempt ${attempt} failed for model ${modelName}`, {
-            error: error.message,
-            errorType: errorInfo.type,
-            remainingAttempts: maxRetries - attempt,
-            model: modelName
-          });
-
-          const isModelUnavailable = errorInfo.type === 'RATE_LIMIT_ERROR' ||
-            error.message.includes('503') ||
-            error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand');
-
-          if (isModelUnavailable && modelName !== modelsToTry[modelsToTry.length - 1]) {
-            break; // try next fallback model
-          }
-
-          if (attempt === maxRetries) {
-            break;
-          }
-
-          const baseDelay = errorInfo.isNetworkError ? 2500 : 1500;
-          const delay = baseDelay * attempt + Math.random() * 1000;
-          await this.delay(delay);
-        }
-      }
-    }
-
-    throw lastError || new Error('Gemini streaming request failed');
-  }
-
-  _streamRequestForModel(geminiRequest, modelName, apiKey, onDelta) {
-    const https = require('https');
-    const timeout = config.get('llm.gemini.timeout');
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
-    const postData = JSON.stringify(geminiRequest);
-    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
-
-    const options = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-        'Content-Length': Buffer.byteLength(postData),
-        'User-Agent': this.getUserAgent()
-      },
-      timeout,
-      agent
-    };
-
-    return new Promise((resolve, reject) => {
-      const req = https.request(url, options, (res) => {
-        if (res.statusCode !== 200) {
-          let errBody = '';
-          res.on('data', (c) => { errBody += c; });
-          res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${errBody}`)));
-          return;
-        }
-
-        let fullText = '';
-        let buffer = '';
-
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => {
-          buffer += chunk;
-          let idx;
-          while ((idx = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, idx).trim();
-            buffer = buffer.slice(idx + 1);
-            if (!line.startsWith('data:')) {
-              continue;
-            }
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') {
-              continue;
-            }
-            try {
-              const json = JSON.parse(payload);
-              const piece = this._extractChunkText(json);
-              if (piece) {
-                fullText += piece;
-                if (typeof onDelta === 'function') {
-                  onDelta(piece);
-                }
-              }
-            } catch (_) {
-              // Partial JSON across chunk boundaries is rare with line framing;
-              // skip anything that doesn't parse cleanly.
-            }
-          }
-        });
-
-        res.on('end', () => resolve(fullText.trim()));
-        res.on('error', (error) => reject(new Error(`Streaming response error: ${error.message}`)));
-      });
-
-      req.on('error', (error) => reject(new Error(`Streaming request failed: ${error.message}`)));
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Streaming request timeout'));
-      });
-
-      req.write(postData);
-      req.end();
-    });
   }
 
   async performPreflightCheck() {

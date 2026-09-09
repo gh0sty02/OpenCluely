@@ -17,6 +17,7 @@ const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
 const { streamCompletion, openAIEvent } = require('./sse-parser');
+const VisibleAnswerFilter = require('./visible-answer-filter');
 
 const OPENROUTER_HOST = 'openrouter.ai';
 const OPENROUTER_PATH = '/api/v1/chat/completions';
@@ -100,7 +101,7 @@ class OpenRouterService {
       const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
       const base64 = imageBuffer.toString('base64');
       const messages = this._buildImageMessages(base64, mimeType, activeSkill, programmingLanguage, skillPrompt);
-      const responseText = await this._executeRequest(messages);
+      const responseText = this._visibleText(await this._executeRequest(messages));
       const finalResponse = programmingLanguage ? this.enforceProgrammingLanguage(responseText, programmingLanguage) : responseText;
       logger.logPerformance('OpenRouter image processing', startTime, { activeSkill, imageSize: imageBuffer.length, responseLength: finalResponse.length, requestId: this.requestCount });
       return { response: finalResponse, metadata: { skill: activeSkill, programmingLanguage, processingTime: Date.now() - startTime, requestId: this.requestCount, usedFallback: false, isImageAnalysis: true, mimeType } };
@@ -125,7 +126,8 @@ class OpenRouterService {
       const skillPrompt = promptLoader.getSkillPrompt(activeSkill, programmingLanguage) || '';
       const base64 = imageBuffer.toString('base64');
       const messages = this._buildImageMessages(base64, mimeType, activeSkill, programmingLanguage, skillPrompt);
-      const fullText = await this._executeStreamingRequest(messages, function(delta) { if (typeof onDelta === 'function' && delta) onDelta(delta); });
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
       const finalResponse = programmingLanguage ? this.enforceProgrammingLanguage(fullText, programmingLanguage) : fullText;
       logger.logPerformance('OpenRouter image streaming', startTime, { activeSkill, imageSize: imageBuffer.length, responseLength: finalResponse.length, requestId: this.requestCount });
       return { response: finalResponse, metadata: { skill: activeSkill, programmingLanguage, processingTime: Date.now() - startTime, requestId: this.requestCount, usedFallback: false, streamed: true, isImageAnalysis: true, mimeType } };
@@ -145,7 +147,7 @@ class OpenRouterService {
     try {
       logger.info('Processing text with OpenRouter', { activeSkill, textLength: text.length, requestId: this.requestCount });
       const messages = this._buildTextMessages(text, activeSkill, sessionMemory, programmingLanguage);
-      const responseText = await this._executeRequest(messages);
+      const responseText = this._visibleText(await this._executeRequest(messages));
       const finalResponse = programmingLanguage ? this.enforceProgrammingLanguage(responseText, programmingLanguage) : responseText;
       logger.logPerformance('OpenRouter text processing', startTime, { activeSkill, textLength: text.length, responseLength: finalResponse.length, requestId: this.requestCount });
       return { response: finalResponse, metadata: { skill: activeSkill, programmingLanguage, processingTime: Date.now() - startTime, requestId: this.requestCount, usedFallback: false } };
@@ -167,7 +169,8 @@ class OpenRouterService {
     this.requestCount++;
     try {
       const messages = this._buildTextMessages(text, activeSkill, sessionMemory, programmingLanguage);
-      const fullText = await this._executeStreamingRequest(messages, function(delta) { if (typeof onDelta === 'function' && delta) onDelta(delta); });
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
       const finalResponse = programmingLanguage ? this.enforceProgrammingLanguage(fullText, programmingLanguage) : fullText;
       logger.logPerformance('OpenRouter text streaming', startTime, { activeSkill, textLength: text.length, responseLength: finalResponse.length, requestId: this.requestCount });
       return { response: finalResponse, metadata: { skill: activeSkill, programmingLanguage, processingTime: Date.now() - startTime, requestId: this.requestCount, usedFallback: false, streamed: true } };
@@ -189,7 +192,7 @@ class OpenRouterService {
       if (!cleanText) throw new Error('Empty transcription text');
       logger.info('Processing transcription with OpenRouter', { activeSkill, textLength: cleanText.length, requestId: this.requestCount });
       const messages = this._buildTranscriptionMessages(cleanText, activeSkill, sessionMemory, programmingLanguage);
-      const responseText = await this._executeRequest(messages);
+      const responseText = this._visibleText(await this._executeRequest(messages));
       const finalResponse = programmingLanguage ? this.enforceProgrammingLanguage(responseText, programmingLanguage) : responseText;
       logger.logPerformance('OpenRouter transcription processing', startTime, { activeSkill, textLength: cleanText.length, responseLength: finalResponse.length, requestId: this.requestCount });
       return { response: finalResponse, metadata: { skill: activeSkill, programmingLanguage, processingTime: Date.now() - startTime, requestId: this.requestCount, usedFallback: false, isTranscriptionResponse: true } };
@@ -213,7 +216,8 @@ class OpenRouterService {
       const cleanText = (text && typeof text === 'string') ? text.trim() : '';
       if (!cleanText) throw new Error('Empty transcription text');
       const messages = this._buildTranscriptionMessages(cleanText, activeSkill, sessionMemory, programmingLanguage);
-      const fullText = await this._executeStreamingRequest(messages, function(delta) { if (typeof onDelta === 'function' && delta) onDelta(delta); });
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
       const finalResponse = programmingLanguage ? this.enforceProgrammingLanguage(fullText, programmingLanguage) : fullText;
       logger.logPerformance('OpenRouter transcription streaming', startTime, { activeSkill, textLength: cleanText.length, responseLength: finalResponse.length, requestId: this.requestCount });
       return { response: finalResponse, metadata: { skill: activeSkill, programmingLanguage, processingTime: Date.now() - startTime, requestId: this.requestCount, usedFallback: false, streamed: true, isTranscriptionResponse: true } };
@@ -432,6 +436,11 @@ class OpenRouterService {
     return prompt;
   }
 
+  _visibleText(text) {
+    const filter = new VisibleAnswerFilter();
+    return filter.push(text) + filter.finish();
+  }
+
   // ── HTTP execution ──────────────────────────────────────────────────
 
   async _executeRequest(messages) {
@@ -454,67 +463,6 @@ class OpenRouterService {
       }
     }
     throw lastError || new Error('OpenRouter request failed after all retries');
-  }
-
-  _executeStreamingRequest(messages, onDelta) {
-    var timeout = config.get('llm.openrouter.timeout') || 60000;
-    var genConfig = config.get('llm.openrouter.generation') || {};
-    var apiKey = this.apiKey;
-    var model = this.model;
-    var transport = this.useHttp ? http : https;
-    var bodyObj = {
-      model: model,
-      messages: messages,
-      stream: true,
-      temperature: genConfig.temperature != null ? genConfig.temperature : 0.7,
-      max_tokens: genConfig.max_tokens || 3000
-    };
-    var body = JSON.stringify(bodyObj);
-    var options = {
-      hostname: this.host, port: this.port, path: this.path, method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + apiKey,
-        'HTTP-Referer': HTTP_REFERER,
-        'X-Title': X_TITLE,
-        'Content-Length': Buffer.byteLength(body)
-      }
-    };
-    return new Promise(function(resolve, reject) {
-      var req = transport.request(options, function(res) {
-        if (res.statusCode !== 200) {
-          var errBody = '';
-          res.on('data', function(c) { errBody += c; });
-          res.on('end', function() { clearTimeout(timer); reject(new Error('HTTP ' + res.statusCode + ': ' + errBody)); });
-          return;
-        }
-        var fullText = '', buffer = '';
-        res.setEncoding('utf8');
-        res.on('data', function(chunk) {
-          buffer += chunk;
-          var idx;
-          while ((idx = buffer.indexOf('\n')) !== -1) {
-            var line = buffer.slice(0, idx).trim();
-            buffer = buffer.slice(idx + 1);
-            if (line.indexOf('data:') !== 0) continue;
-            var payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-            try {
-              var json = JSON.parse(payload);
-              var delta = json && json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content;
-              if (delta) { fullText += delta; if (typeof onDelta === 'function') onDelta(delta); }
-            } catch (e) { /* partial JSON */ }
-          }
-        });
-        res.on('end', function() { clearTimeout(timer); resolve(fullText.trim()); });
-        res.on('error', function(err) { clearTimeout(timer); reject(new Error('Streaming response error: ' + err.message)); });
-      });
-      var timer = setTimeout(function() { req.destroy(); reject(new Error('OpenRouter streaming request timed out')); }, timeout);
-      req.on('error', function(err) { clearTimeout(timer); reject(new Error('Streaming request failed: ' + err.message)); });
-      req.on('close', function() { clearTimeout(timer); });
-      req.write(body);
-      req.end();
-    });
   }
 
   _rawRequest(messages, extraParams) {
