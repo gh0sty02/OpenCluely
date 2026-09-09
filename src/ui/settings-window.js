@@ -107,12 +107,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (openrouterModelInput) openrouterModelInput.value = settings.openrouterModel || '';
         if (openrouterBaseUrlInput) openrouterBaseUrlInput.value = settings.openrouterBaseUrl || '';
 
-        // Set C++ as default if no coding language is specified
+        // Set JavaScript as default if no coding language is specified
         if (codingLanguageSelect) {
-            codingLanguageSelect.value = settings.codingLanguage || 'cpp';
+            codingLanguageSelect.value = settings.codingLanguage || 'javascript';
         }
 
-        if (activeSkillSelect) activeSkillSelect.value = settings.activeSkill || 'interview';
+        if (activeSkillSelect) activeSkillSelect.value = settings.activeSkill || 'general';
 
         // Handle icon selection
         const selectedIcon = settings.selectedIcon || settings.appIcon;

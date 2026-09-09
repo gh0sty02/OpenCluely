@@ -31,6 +31,13 @@
     // reloads and doesn't need to round-trip through the main process.
     let historyHidden = false;
     try { historyHidden = localStorage.getItem('interviewHistoryHidden') === 'true'; } catch (_) { /* private/blocked storage */ }
+    // Teleprompter-style auto-scroll: once the answer has been quiet (no new
+    // streamed text) for a few seconds and the reader hasn't touched the
+    // wheel recently, gently scroll toward the bottom so a long answer can
+    // be read aloud hands-free. Any wheel input pauses it for the same idle
+    // window before it resumes.
+    let lastAnswerChangeAt = 0;
+    let lastUserScrollAt = 0;
 
     // Only one renderer window may own the real audio capture (getDisplayMedia/
     // getUserMedia): the main overlay (body.interview-shell). Other windows
@@ -203,6 +210,7 @@
             renderedAnswer = current?.answer || '';
             renderedQuestion = current?.id || null;
             answer.innerHTML = renderedAnswer ? ui.renderMarkdown(renderedAnswer) : '<p class="interview-empty">Your answer will appear here.</p>';
+            lastAnswerChangeAt = Date.now();
         }
         const historyToggle = host.querySelector('[data-action="toggle-history"]');
         if (historyToggle) historyToggle.textContent = historyHidden ? 'Show history' : 'Hide history';
@@ -223,6 +231,29 @@
             }));
         }
         if (follow && !readingSelection) scrollArea.scrollTop = scrollArea.scrollHeight;
+    }
+
+    if (panel) {
+        const AUTO_SCROLL_IDLE_MS = 3000;
+        const AUTO_SCROLL_PX_PER_SEC = 40;
+        const teleprompterArea = document.getElementById('interviewWorkspace') || panel;
+        teleprompterArea.addEventListener('wheel', () => { lastUserScrollAt = Date.now(); }, { passive: true });
+        let lastTick = null;
+        const tick = now => {
+            if (lastTick == null) lastTick = now;
+            const dt = now - lastTick;
+            lastTick = now;
+            const idleLongEnough = lastAnswerChangeAt && Date.now() - lastAnswerChangeAt >= AUTO_SCROLL_IDLE_MS
+                && Date.now() - lastUserScrollAt >= AUTO_SCROLL_IDLE_MS;
+            const atBottom = teleprompterArea.scrollHeight - teleprompterArea.scrollTop - teleprompterArea.clientHeight < 2;
+            const selection = window.getSelection();
+            const readingSelection = selection && !selection.isCollapsed && teleprompterArea.contains(selection.anchorNode);
+            if (idleLongEnough && !atBottom && !readingSelection) {
+                teleprompterArea.scrollTop += (AUTO_SCROLL_PX_PER_SEC * dt) / 1000;
+            }
+            requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
     }
 
     document.addEventListener('selectionchange', () => { if (window.getSelection()?.isCollapsed) render(snapshot); });

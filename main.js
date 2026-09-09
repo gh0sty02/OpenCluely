@@ -128,9 +128,9 @@ class ApplicationController {
   constructor() {
     this.isReady = false;
     this.starting = false;
-    this.activeSkill = "dsa";
-  // Default to C++ so language is enforced from first run
-  this.codingLanguage = "cpp";
+    this.activeSkill = "general";
+  // JavaScript needs no compiler/runtime setup, so it's the safest default.
+  this.codingLanguage = "javascript";
     this.speechAvailable = false;
 
     // Content-free latency diagnostics: bounded per-question stage timing
@@ -148,6 +148,11 @@ class ApplicationController {
       getAutoAnswerDefault(),
       getAutoAnswerSilenceMs()
     );
+    // Settings saves already sync the panel's mode from activeSkill (see the
+    // save-settings handler below); do the same once at startup so the panel
+    // reflects the configured/default skill immediately instead of starting
+    // on the session controller's own internal default.
+    this.interviewController.setMode(this.activeSkill);
     this.interviewController.on("state", (snapshot) => {
       windowManager.broadcastToAllWindows("interview-state", snapshot);
     });
@@ -1729,8 +1734,8 @@ class ApplicationController {
     // using. Empty strings are returned rather than skipped so the UI can
     // distinguish "unset" from "stale value from a previous load".
     return {
-      codingLanguage: this.codingLanguage || "cpp",
-      activeSkill: this.activeSkill || "dsa",
+      codingLanguage: this.codingLanguage || "javascript",
+      activeSkill: this.activeSkill || "general",
       audioSource: process.env.AUDIO_SOURCE === "microphone" ? "microphone" : "system",
       autoAnswer: getAutoAnswerDefault(),
       autoAnswerSilenceMs: getAutoAnswerSilenceMs(),
