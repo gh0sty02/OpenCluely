@@ -6,12 +6,21 @@
 'use strict';
 
 const https = require('https');
+const http = require('http');
+// Explicit Node URL, not the bare global: some dependency in this app's tree
+// replaces the global `URL` with a broken polyfill that mis-parses a path
+// segment following a port (e.g. "http://localhost:20128/v1" resolves
+// pathname to "/" instead of "/v1") — silently corrupting a custom
+// OPENROUTER_BASE_URL. Node's own URL is unaffected.
+const { URL } = require('node:url');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const { streamCompletion, openAIEvent } = require('./sse-parser');
 
 const OPENROUTER_HOST = 'openrouter.ai';
 const OPENROUTER_PATH = '/api/v1/chat/completions';
+const OPENROUTER_PORT = 443;
 const HTTP_REFERER = 'https://github.com/OpenCluely/OpenCluely';
 const X_TITLE = 'OpenCluely';
 
@@ -32,6 +41,9 @@ class OpenRouterService {
     this.apiKey = null;
     this.model = null;
     this.isInitialized = false;
+    this.host = OPENROUTER_HOST;
+    this.path = OPENROUTER_PATH;
+    this.port = OPENROUTER_PORT;
 
     const apiKey = config.getApiKey('OPENROUTER');
     if (!apiKey || apiKey === 'your_openrouter_key_here') {
@@ -44,8 +56,31 @@ class OpenRouterService {
       // immediately when initializeClient() is called after save (no restart needed).
       const envModel = (process.env.OPENROUTER_MODEL || '').trim();
       this.model = envModel || config.get('llm.openrouter.model') || 'anthropic/claude-sonnet-4';
+
+      // Optional custom OpenAI-compatible endpoint (e.g. a self-hosted proxy).
+      // Falls back to openrouter.ai when unset or unparseable.
+      const envBaseUrl = (process.env.OPENROUTER_BASE_URL || '').trim();
+      const baseUrl = envBaseUrl || config.get('llm.openrouter.baseUrl') || '';
+      if (baseUrl) {
+        try {
+          const parsed = new URL(baseUrl);
+          this.host = parsed.hostname;
+          // OPENROUTER_BASE_URL follows the OpenAI-SDK convention of naming
+          // just the base (e.g. ".../v1") — the client appends the endpoint
+          // path itself, same as openrouter.ai's default OPENROUTER_PATH
+          // above. Only append when the caller hasn't already included it
+          // (a base URL copied from elsewhere might already end in it).
+          const basePath = parsed.pathname.replace(/\/+$/, '');
+          this.path = (/\/chat\/completions$/.test(basePath) ? basePath : `${basePath}/chat/completions`) + parsed.search;
+          this.port = parsed.port ? Number(parsed.port) : (parsed.protocol === 'http:' ? 80 : 443);
+          this.useHttp = parsed.protocol === 'http:';
+        } catch (e) {
+          logger.warn('Invalid OPENROUTER_BASE_URL, falling back to openrouter.ai', { baseUrl, error: e.message });
+        }
+      }
+
       this.isInitialized = true;
-      logger.info('OpenRouter client initialized successfully', { model: this.model });
+      logger.info('OpenRouter client initialized successfully', { model: this.model, host: this.host, path: this.path });
     } catch (error) {
       logger.error('Failed to initialize OpenRouter client', { error: error.message });
     }
@@ -188,6 +223,44 @@ class OpenRouterService {
     }
   }
 
+  /**
+   * Streaming completion for the interview session controller: takes
+   * pre-composed OpenAI-style messages and a coordinator-owned AbortSignal,
+   * and routes through the shared, deadline/retry-hardened SSE pipeline
+   * instead of the ad-hoc streaming used by the legacy skill methods above.
+   * Returns {text, finishReason, timing}; throws a providerError with a
+   * `code` (e.g. EMPTY_RESPONSE, CANCELLED, AUTH_ERROR) on failure.
+   */
+  generateAnswer({ messages, signal, onDelta } = {}) {
+    if (!this.isInitialized) throw new Error('OpenRouter service not initialized. Check OPENROUTER_API_KEY configuration.');
+    const genConfig = config.get('llm.openrouter.generation') || {};
+    const body = JSON.stringify({
+      model: this.model,
+      messages,
+      stream: true,
+      temperature: genConfig.temperature != null ? genConfig.temperature : 0.7,
+      max_tokens: genConfig.max_tokens || 3000
+    });
+    const requestOptions = {
+      hostname: this.host, port: this.port, path: this.path, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + this.apiKey,
+        'HTTP-Referer': HTTP_REFERER,
+        'X-Title': X_TITLE,
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+    return streamCompletion({
+      transport: this.useHttp ? http : https,
+      requestOptions,
+      body,
+      parseEvent: openAIEvent,
+      signal,
+      onDelta
+    });
+  }
+
   // Pure-text fallback — identical logic to llm.service.js (provider-agnostic)
   generateIntelligentFallbackResponse(text, activeSkill) {
     logger.info('Generating intelligent fallback response', { activeSkill });
@@ -209,9 +282,11 @@ class OpenRouterService {
     var hasRelevantKeywords = relevantKeywords.some(function(kw) { return textLower.indexOf(kw) !== -1; });
     var questionIndicators = ['how', 'what', 'why', 'when', 'where', 'can you', 'could you', 'should i', '?'];
     var seemsLikeQuestion = questionIndicators.some(function(ind) { return textLower.indexOf(ind) !== -1; });
-    var response = (hasRelevantKeywords || seemsLikeQuestion)
+    var response = hasRelevantKeywords
       ? 'I\'m having trouble processing that right now, but it sounds like a ' + activeSkill + ' question. Could you rephrase or ask more specifically about what you need help with?'
-      : 'Yeah, I\'m listening. Ask your question relevant to ' + activeSkill + '.';
+      : seemsLikeQuestion
+        ? 'I\'m having trouble processing that right now — could you repeat the question?'
+        : 'Yeah, I\'m listening. Ask your question relevant to ' + activeSkill + '.';
     return { response: response, metadata: { skill: activeSkill, processingTime: 0, requestId: this.requestCount, usedFallback: true, isTranscriptionResponse: true } };
   }
 
@@ -238,7 +313,7 @@ class OpenRouterService {
   async checkNetworkConnectivity() {
     var connectivityTests = [
       { host: 'google.com', port: 443, name: 'Google (HTTPS)' },
-      { host: 'openrouter.ai', port: 443, name: 'OpenRouter API Endpoint' }
+      { host: this.host, port: this.port, name: 'LLM API Endpoint' }
     ];
     var self = this;
     var results = await Promise.allSettled(connectivityTests.map(function(test) { return self.testNetworkConnection(test); }));
@@ -341,7 +416,18 @@ class OpenRouterService {
       prompt += '\n\nCODING CONTEXT: Respond ONLY in ' + languageTitle + '. All code blocks must use triple backticks with language tag ```' + fenceTag + '```. Do not include other languages unless explicitly asked.';
     }
 
-    prompt += '\n\n## Response Rules:\n\n### If the transcription is casual conversation, greetings, or NOT related to ' + activeSkill + ':\n- Respond with: "Yeah, I\'m listening. Ask your question relevant to ' + activeSkill + '."\n- Or similar brief acknowledgments.\n\n### If the transcription IS relevant to ' + activeSkill + ' or is a follow-up question:\n- Provide a comprehensive, detailed response\n- Use bullet points, examples, and explanations\n- Focus on actionable insights and complete answers\n- Do not truncate or shorten your response\n\n## Response Format:\n- Keep responses detailed\n- Use bullet points for structured answers\n- Be encouraging and helpful\n- Stay focused on ' + activeSkill + '\n\nIf the user\'s input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.\n\nRemember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ' + activeSkill + '.';
+    prompt += '\n\n## Response Rules:\n\n' +
+      '### If the transcription IS relevant to ' + activeSkill + ' or is a follow-up question:\n' +
+      '- Provide a comprehensive, detailed response\n- Use bullet points, examples, and explanations\n- Focus on actionable insights and complete answers\n- Do not truncate or shorten your response\n\n' +
+      '### If the transcription is a general interview question NOT related to ' + activeSkill + '\n' +
+      '(e.g. "tell me about yourself," "why this role," strengths/weaknesses, a factual or general-knowledge question, small talk that expects an actual answer):\n' +
+      '- Answer it directly and concisely — don\'t dodge it just because it\'s off-skill\n- Keep it brief (a few sentences), not a ' + activeSkill + '-style deep dive\n- Do not mention that it\'s unrelated to ' + activeSkill + '\n\n' +
+      '### If the transcription is pure noise, silence artifacts, or has no real question\n' +
+      '(e.g. background chatter, "um," a stray word, near-empty transcript):\n' +
+      '- Respond with: "Yeah, I\'m listening. Ask your question relevant to ' + activeSkill + '."\n- Or similar brief acknowledgments.\n\n' +
+      '## Response Format:\n- Keep responses detailed for ' + activeSkill + ' questions\n- Keep responses brief for general/off-skill questions\n- Use bullet points where helpful\n- Be encouraging and helpful\n\n' +
+      'If the user\'s input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.\n\n' +
+      'Remember: Be intelligent about filtering - only brush off true noise/silence. Always answer real questions, whether about ' + activeSkill + ' or general interview questions.';
 
     return prompt;
   }
@@ -375,6 +461,7 @@ class OpenRouterService {
     var genConfig = config.get('llm.openrouter.generation') || {};
     var apiKey = this.apiKey;
     var model = this.model;
+    var transport = this.useHttp ? http : https;
     var bodyObj = {
       model: model,
       messages: messages,
@@ -384,7 +471,7 @@ class OpenRouterService {
     };
     var body = JSON.stringify(bodyObj);
     var options = {
-      hostname: OPENROUTER_HOST, path: OPENROUTER_PATH, method: 'POST',
+      hostname: this.host, port: this.port, path: this.path, method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + apiKey,
@@ -394,7 +481,7 @@ class OpenRouterService {
       }
     };
     return new Promise(function(resolve, reject) {
-      var req = https.request(options, function(res) {
+      var req = transport.request(options, function(res) {
         if (res.statusCode !== 200) {
           var errBody = '';
           res.on('data', function(c) { errBody += c; });
@@ -436,6 +523,7 @@ class OpenRouterService {
     var genConfig = config.get('llm.openrouter.generation') || {};
     var apiKey = this.apiKey;
     var model = this.model;
+    var transport = this.useHttp ? http : https;
     var bodyObj = {
       model: model,
       messages: messages,
@@ -445,7 +533,7 @@ class OpenRouterService {
     };
     var body = JSON.stringify(bodyObj);
     var options = {
-      hostname: OPENROUTER_HOST, path: OPENROUTER_PATH, method: 'POST',
+      hostname: this.host, port: this.port, path: this.path, method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + apiKey,
@@ -455,7 +543,7 @@ class OpenRouterService {
       }
     };
     return new Promise(function(resolve, reject) {
-      var req = https.request(options, function(res) {
+      var req = transport.request(options, function(res) {
         var data = '';
         res.on('data', function(chunk) { data += chunk; });
         res.on('end', function() {

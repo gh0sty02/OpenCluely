@@ -65,7 +65,67 @@ class PromptLoader {
       promptContent = this.injectProgrammingLanguage(promptContent, programmingLanguage, normalizedSkillName);
     }
 
+    promptContent += this._getOffSkillAddendum(normalizedSkillName);
+
     return promptContent;
+  }
+
+  getInterviewPrompt(skillName = 'interview', programmingLanguage = null) {
+    this.loadPrompts();
+    const skill = this.normalizeSkillName(skillName);
+    let prompt = this.prompts.get('interview');
+    const specialized = this.prompts.get(skill);
+    if (skill !== 'interview' && specialized) {
+      prompt += `\n\n## Selected mode: ${skill}\n${specialized}`;
+    }
+    // This final policy resolves strict legacy formats without changing saved modes.
+    prompt += '\n\n## Interview answer policy\nApply the selected mode only when relevant to the current question. Answer off-topic questions directly. For conceptual or behavioral questions, ignore coding-only formatting and do not force code. Start with a concise answer, then add useful supporting detail. Never invent personal facts or experiences; label examples and use placeholders when facts are missing. Follow-ups use the recent conversation.';
+    if (programmingLanguage) {
+      const language = { cpp: 'C++', js: 'JavaScript' }[programmingLanguage] || programmingLanguage;
+      prompt += `\nUse ${language} only for relevant code, with correctly tagged code fences. This constraint does not apply to prose. Do not add code just because a language is selected.`;
+    }
+    return prompt;
+  }
+
+  estimateMessagesTokens(messages) {
+    // UTF-8 bytes / 2 deliberately reserves more than the usual English estimate.
+    return messages.reduce((total, message) => total + Math.ceil(Buffer.byteLength(message.content, 'utf8') / 2) + 12, 0);
+  }
+
+  composeMessages({ text, activeSkill = 'interview', programmingLanguage = null, history = [], inputBudgetTokens = 8192 } = {}) {
+    const question = typeof text === 'string' ? text.trim() : '';
+    if (!question) throw Object.assign(new Error('Enter an interview question.'), { code: 'EMPTY_QUESTION', retryable: false });
+    const system = { role: 'system', content: this.getInterviewPrompt(activeSkill, programmingLanguage) };
+    const current = { role: 'user', content: question };
+    const budget = Math.floor((Number.isFinite(inputBudgetTokens) && inputBudgetTokens > 0 ? inputBudgetTokens : 8192) * 0.8);
+    let tokens = this.estimateMessagesTokens([system, current]);
+    if (tokens > budget) throw Object.assign(new Error('The question and instructions exceed the configured input budget. Shorten the question or increase the budget.'), { code: 'CONTEXT_TOO_LONG', retryable: false });
+    const recent = (Array.isArray(history) ? history : []).filter(event => ['user', 'assistant', 'model'].includes(event.role) && typeof event.content === 'string' && event.content.trim()).map(event => ({ role: event.role === 'model' ? 'assistant' : event.role, content: event.content.trim() }));
+    // A pending current user event can already have been stored by the caller.
+    // Remove that tail only; identical questions from completed turns stay intact.
+    if (recent.at(-1)?.role === 'user' && recent.at(-1).content === question) recent.pop();
+    const selected = [];
+    for (let index = recent.length - 1; index >= 0; index--) {
+      const cost = this.estimateMessagesTokens([recent[index]]);
+      if (tokens + cost > budget) break;
+      selected.unshift(recent[index]);
+      tokens += cost;
+    }
+    // Avoid sending an orphan answer without the question it answered.
+    while (selected[0]?.role === 'assistant') selected.shift();
+    return [system, ...selected, current];
+  }
+
+  /**
+   * Every skill prompt above is strict about ITS domain (e.g. dsa.md only
+   * talks about algorithms) with no allowance for anything else. Without
+   * this, a general interview question ("tell me about yourself", a factual
+   * question) gets refused/redirected instead of answered. Appended to every
+   * skill prompt so text, image, and transcription requests all inherit it
+   * from this one place.
+   */
+  _getOffSkillAddendum(skillName) {
+    return `\n\n## Handling off-topic questions\nThe rules above are for ${skillName.toUpperCase()} questions specifically. If the input is instead a general interview question (e.g. "tell me about yourself", "why this role", strengths/weaknesses) or a general-knowledge/factual question, ignore the ${skillName.toUpperCase()}-specific format rules and just answer it directly and concisely in a few sentences — don't refuse it or redirect back to ${skillName.toUpperCase()}. Only decline to answer if the input is genuine noise/silence with no real question in it.`;
   }
 
   /**
@@ -315,13 +375,17 @@ STRICT REQUIREMENTS:
    * @returns {string} Normalized skill name
    */
   normalizeSkillName(skillName) {
-    if (!skillName) return 'general';
+    if (!skillName) return 'interview';
     
     // Convert to lowercase and handle common variations
     const normalized = skillName.toLowerCase().trim();
     
     // Map common variations to standard names
     const skillMap = {
+      'auto': 'interview',
+      'auto-interview': 'interview',
+      'interview': 'interview',
+      'general': 'general',
       'dsa': 'dsa',
       'data-structures': 'dsa',
       'algorithms': 'dsa',

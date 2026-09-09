@@ -64,6 +64,9 @@ class ConfigManager {
           // Vision-capable model that also handles text well.
           // Override with OPENROUTER_MODEL env var or via the settings UI.
           model: process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4',
+          // Full chat-completions URL of an OpenAI-compatible endpoint.
+          // Leave unset to talk to openrouter.ai directly.
+          baseUrl: (process.env.OPENROUTER_BASE_URL || '').trim(),
           maxRetries: 3,
           timeout: 60000,
           fallbackEnabled: true,
@@ -81,6 +84,11 @@ class ConfigManager {
           enableDictation: true,
           enableAudioLogging: false,
           outputFormat: 'detailed'
+        },
+        mistral: {
+          model: 'voxtral-mini-latest',
+          timeout: 30000,
+          language: 'auto'
         },
         whisper: {
           model: 'small',

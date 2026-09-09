@@ -1,7 +1,13 @@
 const { GoogleGenAI } = require('@google/genai');
+const https = require('https');
+// Explicit Node URL, not the bare global — see the matching note in
+// openrouter.service.js: some dependency here replaces global URL with a
+// polyfill that mis-parses paths after an explicit port.
+const { URL } = require('node:url');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const { streamCompletion, geminiEvent } = require('./sse-parser');
 
 class LLMService {
   constructor() {
@@ -61,6 +67,48 @@ class LLMService {
   applyGenerationDefaults(request, overrides = {}) {
     request.generationConfig = this.getGenerationConfig({ ...(request.generationConfig || {}), ...overrides });
     return request;
+  }
+
+  /**
+   * Streaming completion for the interview session controller: takes
+   * pre-composed OpenAI-style messages (system/user/assistant) and a
+   * coordinator-owned AbortSignal, converts them to Gemini's contents/
+   * systemInstruction shape, and routes through the shared, deadline/retry-
+   * hardened SSE pipeline. Returns {text, finishReason, timing}; throws a
+   * providerError with a `code` (e.g. EMPTY_RESPONSE, CANCELLED, AUTH_ERROR).
+   */
+  generateAnswer({ messages, signal, onDelta } = {}) {
+    if (!this.isInitialized) throw new Error('Gemini service not initialized. Check GEMINI_API_KEY configuration.');
+    const apiKey = config.getApiKey('GEMINI');
+    const systemMessage = messages.find(message => message.role === 'system');
+    const contents = messages
+      .filter(message => message.role !== 'system')
+      .map(message => ({ role: message.role === 'assistant' ? 'model' : 'user', parts: [{ text: message.content }] }));
+    const geminiRequest = this.applyGenerationDefaults({
+      contents,
+      ...(systemMessage ? { systemInstruction: { parts: [{ text: systemMessage.content }] } } : {})
+    });
+    const body = JSON.stringify(geminiRequest);
+    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${this.model}:streamGenerateContent?alt=sse`);
+    const requestOptions = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent': this.getUserAgent()
+      }
+    };
+    return streamCompletion({
+      transport: https,
+      requestOptions,
+      body,
+      parseEvent: geminiEvent,
+      signal,
+      onDelta
+    });
   }
 
   extractTextFromCandidates(response) {
@@ -799,21 +847,23 @@ Always respond to the point, do not repeat the question or unnecessary informati
 
 ## Response Rules:
 
-### If the transcription is casual conversation, greetings, or NOT related to ${activeSkill}:
-- Respond with: "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
-- Or similar brief acknowledgments like: "I'm here, what's your ${activeSkill} question?"
-
 ### If the transcription IS relevant to ${activeSkill} or is a follow-up question:
 - Provide a comprehensive, detailed response
 - Use bullet points, examples, and explanations
 - Focus on actionable insights and complete answers
 - Do not truncate or shorten your response
 
-### Examples of casual/irrelevant messages:
-- "Hello", "Hi there", "How are you?"
-- "What's the weather like?"
-- "I'm just testing this"
-- Random conversations not related to ${activeSkill}
+### If the transcription is a general interview question NOT related to ${activeSkill}
+(e.g. "tell me about yourself," "why this role," strengths/weaknesses, a factual
+or general-knowledge question, small talk that expects an actual answer):
+- Answer it directly and concisely — don't dodge it just because it's off-skill
+- Keep it brief (a few sentences), not a ${activeSkill}-style deep dive
+- Do not mention that it's unrelated to ${activeSkill}
+
+### If the transcription is pure noise, silence artifacts, or has no real question
+(e.g. background chatter, "um," a stray word, near-empty transcript):
+- Respond with: "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
+- Or similar brief acknowledgments like: "I'm here, what's your ${activeSkill} question?"
 
 ### Examples of relevant messages:
 - Actual questions about ${activeSkill} concepts
@@ -821,15 +871,24 @@ Always respond to the point, do not repeat the question or unnecessary informati
 - Requests for clarification on ${activeSkill} topics
 - Problem-solving requests related to ${activeSkill}
 
+### Examples of general-but-answerable questions:
+- "Tell me about yourself", "Why do you want this role?", "What are your strengths?"
+- Factual or general-knowledge questions with a clear answer
+- Any question the candidate would be expected to actually respond to in an interview
+
+### Examples of noise (brush off):
+- Silence, background chatter, filler sounds with no question
+- Fragments too short/garbled to mean anything
+
 ## Response Format:
-- Keep responses detailed
-- Use bullet points for structured answers
+- Keep responses detailed for ${activeSkill} questions
+- Keep responses brief for general/off-skill questions
+- Use bullet points for structured answers where helpful
 - Be encouraging and helpful
-- Stay focused on ${activeSkill}
 
 If the user's input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.
 
-Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
+Remember: Be intelligent about filtering - only brush off true noise/silence. Always answer real questions, whether they're about ${activeSkill} or general interview questions.`;
 
     return prompt;
   }
@@ -1375,12 +1434,14 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const seemsLikeQuestion = questionIndicators.some(indicator => textLower.includes(indicator));
 
     let response;
-    if (hasRelevantKeywords || seemsLikeQuestion) {
+    if (hasRelevantKeywords) {
       response = `I'm having trouble processing that right now, but it sounds like a ${activeSkill} question. Could you rephrase or ask more specifically about what you need help with?`;
+    } else if (seemsLikeQuestion) {
+      response = `I'm having trouble processing that right now — could you repeat the question?`;
     } else {
       response = `Yeah, I'm listening. Ask your question relevant to ${activeSkill}.`;
     }
-    
+
     return {
       response,
       metadata: {
