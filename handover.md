@@ -91,11 +91,11 @@ Also added the previously-missing "separate question" acceptance test
 
 ## What's verified vs. not
 
-**Verified deterministically** (`npm.cmd test`, run this session: 122/122
-tests passed; `npm.cmd run check`, run this session: 51 files, 0 syntax
+**Verified deterministically** (`npm.cmd test`, run this session: 131/131
+tests passed; `npm.cmd run check`, run this session: 53 files, 0 syntax
 failures): the acoustic pause-timing table (continuous, natural pause,
-boundary margin, slow second transcription rows; the separate-question row
-lacks direct coverage), every reasoning-fixture case in the plan's Task 8
+boundary margin, slow second transcription, and separate-question rows, all
+five with direct coverage), every reasoning-fixture case in the plan's Task 8
 Step 3 (split tags at every character boundary, structured OpenAI/Gemini
 reasoning, unclosed blocks, visible code containing literal tags, reasoning-
 only output), latency stage math, and UI label derivation. Full row-by-row

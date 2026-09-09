@@ -107,7 +107,7 @@ finishing this branch found five findings (see the fix commits on
 `feat/openrouter-provider` following `2f63a3f`), one of which was the
 "Separate question" row above having no direct test. Fixing that, plus a
 latency-metrics regression test and an auto-answer-config test suite added
-during the same pass, brought `npm.cmd test` to **130/130 passed** and
+during the same pass, brought `npm.cmd test` to **131/131 passed** and
 `npm.cmd run check` to **53/53 files, 0 syntax failures**. The commands and
 their pass/fail status are unchanged in kind from the run above; only the
 counts moved.
@@ -201,7 +201,7 @@ perform in this session.
 | 1. Audio fixture provenance documented | Done (`tests/fixtures/audio/README.md`); no actual audio files, by design (no recording/synthesis capability here). |
 | 2. Pause scenarios | Deterministically verified for continuous (partially, general case only), natural pause, boundary margin (as a superset), slow second transcription, and separate question (all five rows). Live confirmation not run. |
 | 3. Reasoning-output fixtures | Fully verified deterministically across all five required cases. |
-| 4. Deterministic verification | Run for real this session: 130/130 tests passed, 53/53 files syntax-clean. |
+| 4. Deterministic verification | Run for real this session: 131/131 tests passed, 53/53 files syntax-clean. |
 | 5. Live system-audio interview | Not run: no audio hardware in this environment. |
 | 6. Warm/cold latency measurement | Not run: requires Step 5 plus a configured, live-answering provider. |
 | 7. Windows package build | Not run, by instruction: too long-running/resource-heavy and needs human verification. |
