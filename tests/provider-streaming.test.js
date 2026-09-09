@@ -43,6 +43,50 @@ test('multiple events, Unicode, and completion resolve exactly once', async t =>
   assert.ok(result.timing.firstTokenMs >= 0);
 });
 
+test('stream completion emits and returns only text after split leading reasoning blocks', async t => {
+  const options = await fixture(t, (_req, res) => {
+    res.write(event('<thi'));
+    res.write(event('nk>private'));
+    res.end(event('</think>\n\nVisible answer', 'stop'));
+  });
+  const deltas = [];
+  const result = await streamCompletion({ ...options, onDelta: delta => deltas.push(delta) });
+  assert.equal(result.text, 'Visible answer');
+  assert.deepEqual(deltas, ['Visible answer']);
+});
+
+test('stream completion rejects reasoning-only output as empty', async t => {
+  const options = await fixture(t, (_req, res) => {
+    res.end(event('<analysis>private</analysis>', 'stop'));
+  });
+  await assert.rejects(streamCompletion(options), error =>
+    error.code === 'EMPTY_RESPONSE' && error.partialText === '');
+});
+
+test('stream errors retain visible partial output without hidden reasoning', async t => {
+  const options = await fixture(t, (_req, res) => {
+    res.end(event('<reasoning>private</reasoning>\nPartial'));
+  });
+  await assert.rejects(streamCompletion(options), error =>
+    error.code === 'INCOMPLETE_RESPONSE' && error.partialText === 'Partial');
+});
+
+test('each retry attempt starts with a fresh visible-answer filter', async t => {
+  let calls = 0;
+  const options = await fixture(t, (_req, res) => {
+    calls++;
+    if (calls === 1) {
+      res.write(event('<think>private'));
+      setTimeout(() => res.destroy(), 10);
+      return;
+    }
+    res.end(event('Recovered answer', 'stop'));
+  });
+  const result = await streamCompletion(options);
+  assert.equal(result.text, 'Recovered answer');
+  assert.equal(calls, 2);
+});
+
 for (const [name, body, code, partial] of [
   ['empty', 'data: [DONE]\n\n', 'EMPTY_RESPONSE', ''],
   ['malformed', 'data: {broken}\n\n', 'MALFORMED_RESPONSE', ''],

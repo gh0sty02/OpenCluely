@@ -1,6 +1,7 @@
 'use strict';
 
 const { StringDecoder } = require('node:string_decoder');
+const VisibleAnswerFilter = require('./visible-answer-filter');
 
 function providerError(code, message, retryable = false, extra = {}) {
   return Object.assign(new Error(message), { code, retryable, ...extra });
@@ -105,6 +106,7 @@ function streamAttempt(options, remainingMs, reportDelta) {
   const { transport, requestOptions, body, parseEvent, signal, firstTokenMs = 15000, idleMs = 15000 } = options;
   return new Promise((resolve, reject) => {
     let request, response, terminal = false, text = '', firstToken = null, idleTimer;
+    const visibleAnswer = new VisibleAnswerFilter();
     const started = Date.now();
     const totalTimer = setTimeout(() => finish(providerError('TOTAL_TIMEOUT', 'The answer exceeded its total time limit.')), remainingMs);
     const firstTimer = setTimeout(() => finish(providerError('FIRST_TOKEN_TIMEOUT', 'The provider did not start an answer in time.', true)), firstTokenMs);
@@ -113,12 +115,14 @@ function streamAttempt(options, remainingMs, reportDelta) {
     function finish(error, finishReason) {
       if (terminal) return;
       terminal = true;
+      appendVisible(visibleAnswer.finish());
       clearTimeout(totalTimer);
       clearTimeout(firstTimer);
       clearTimeout(idleTimer);
       signal?.removeEventListener('abort', abort);
       response?.destroy();
       request?.destroy();
+      if (!error && !text.trim()) error = providerError('EMPTY_RESPONSE', 'The provider returned no answer.');
       if (error) {
         error.partialText = text;
         if (text) error.retryable = false;
@@ -126,25 +130,27 @@ function streamAttempt(options, remainingMs, reportDelta) {
       } else resolve({ text: text.trim(), finishReason, timing: { firstTokenMs: firstToken == null ? null : firstToken - started, totalMs: Date.now() - started } });
     }
 
+    function appendVisible(delta) {
+      if (!delta) return;
+      text += delta;
+      if (Buffer.byteLength(text) > 4 * 1024 * 1024) throw providerError('RESPONSE_TOO_LARGE', 'The provider answer exceeded the supported size.');
+      if (firstToken == null) firstToken = Date.now();
+      clearTimeout(firstTimer);
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => finish(providerError('IDLE_TIMEOUT', 'The provider stopped sending the answer.')), idleMs);
+      reportDelta(delta);
+    }
+
     const parser = new SSEParser(payload => {
       if (terminal) return;
       const event = parseEvent(payload);
-      if (event.delta) {
-        text += event.delta;
-        if (Buffer.byteLength(text) > 4 * 1024 * 1024) throw providerError('RESPONSE_TOO_LARGE', 'The provider answer exceeded the supported size.');
-        if (firstToken == null) firstToken = Date.now();
-        clearTimeout(firstTimer);
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => finish(providerError('IDLE_TIMEOUT', 'The provider stopped sending the answer.')), idleMs);
-        reportDelta(event.delta);
-      }
+      if (event.delta) appendVisible(visibleAnswer.push(event.delta));
       if (terminal || !event.done) return;
       const reason = event.finishReason;
       if (!['stop', 'STOP', 'end_turn'].includes(reason)) {
         const blocked = ['content_filter', 'SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT'].includes(reason);
         finish(providerError(blocked ? 'CONTENT_BLOCKED' : 'INCOMPLETE_RESPONSE', blocked ? 'The provider blocked the answer.' : 'The provider stopped before completing the answer.'));
-      } else if (!text.trim()) finish(providerError('EMPTY_RESPONSE', 'The provider returned no answer.'));
-      else finish(null, reason);
+      } else finish(null, reason);
     });
 
     signal?.addEventListener('abort', abort, { once: true });
