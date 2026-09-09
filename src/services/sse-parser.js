@@ -115,7 +115,11 @@ function streamAttempt(options, remainingMs, reportDelta) {
     function finish(error, finishReason) {
       if (terminal) return;
       terminal = true;
-      appendVisible(visibleAnswer.finish());
+      try {
+        appendVisible(visibleAnswer.finish());
+      } catch (flushError) {
+        error = flushError.code ? flushError : providerError('MALFORMED_RESPONSE', 'The provider stream could not be processed.');
+      }
       clearTimeout(totalTimer);
       clearTimeout(firstTimer);
       clearTimeout(idleTimer);

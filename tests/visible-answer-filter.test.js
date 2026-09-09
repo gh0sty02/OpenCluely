@@ -73,6 +73,23 @@ test('discards hidden blocks larger than 64 KiB without releasing private text',
   assert.equal(filter.finish(), '');
 });
 
+test('streams a long visible whitespace prefix instead of retaining it until EOF', () => {
+  const filter = new VisibleAnswerFilter();
+  const whitespace = ' '.repeat(64 * 1024);
+  assert.equal(filter.push(whitespace), '');
+  assert.equal(filter.push(whitespace), whitespace);
+  assert.equal(filter.push('Answer'), whitespace + 'Answer');
+  assert.equal(filter.finish(), '');
+});
+
+test('bounds whitespace retained beside a split opening tag', () => {
+  const filter = new VisibleAnswerFilter();
+  const whitespace = ' '.repeat(128 * 1024);
+  assert.equal(filter.push(whitespace + '<thi'), whitespace.slice(0, 64 * 1024));
+  assert.equal(filter.push('nk>private</think>Answer'), 'Answer');
+  assert.equal(filter.finish(), '');
+});
+
 test('releases an incomplete opening-tag prefix as visible text at EOF', () => {
   const filter = new VisibleAnswerFilter();
   assert.equal(filter.push('<thi'), '');

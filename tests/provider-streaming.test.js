@@ -71,6 +71,26 @@ test('stream errors retain visible partial output without hidden reasoning', asy
     error.code === 'INCOMPLETE_RESPONSE' && error.partialText === 'Partial');
 });
 
+test('oversized leading whitespace rejects instead of leaving completion pending', async t => {
+  const options = await fixture(t, (_req, res) => {
+    const chunk = ' '.repeat(64 * 1024);
+    for (let index = 0; index < 65; index++) res.write(event(chunk));
+    res.end(event('', 'stop'));
+  });
+  let watchdog;
+  const pending = streamCompletion({ ...options, maxRetries: 0, firstTokenMs: 1200, totalMs: 1200 });
+  const timed = new Promise((_, reject) => {
+    watchdog = setTimeout(() => reject(Object.assign(new Error('Completion remained pending.'), {
+      code: 'TEST_TIMEOUT'
+    })), 1000);
+  });
+  try {
+    await assert.rejects(Promise.race([pending, timed]), { code: 'RESPONSE_TOO_LARGE' });
+  } finally {
+    clearTimeout(watchdog);
+  }
+});
+
 test('each retry attempt starts with a fresh visible-answer filter', async t => {
   let calls = 0;
   const options = await fixture(t, (_req, res) => {

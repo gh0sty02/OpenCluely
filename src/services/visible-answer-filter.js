@@ -1,6 +1,7 @@
 'use strict';
 
 const OPEN_TAGS = ['think', 'thinking', 'analysis', 'reasoning'];
+const MAX_PROBE_CHARS = 64 * 1024;
 
 class VisibleAnswerFilter {
   constructor() {
@@ -23,7 +24,18 @@ class VisibleAnswerFilter {
         input = '';
         const leadingWhitespace = this.buffer.match(/^\s*/)[0].length;
         const candidate = this.buffer.slice(leadingWhitespace);
-        if (!candidate) return output;
+        if (!candidate) {
+          if (this.removedHiddenBlock) {
+            this.buffer = '';
+            return output;
+          }
+          if (this.buffer.length > MAX_PROBE_CHARS) {
+            const releasedLength = this.buffer.length - MAX_PROBE_CHARS;
+            output += this.buffer.slice(0, releasedLength);
+            this.buffer = this.buffer.slice(releasedLength);
+          }
+          return output;
+        }
 
         const opening = candidate.match(/^<(think|thinking|analysis|reasoning)>/i);
         if (opening) {
@@ -36,7 +48,16 @@ class VisibleAnswerFilter {
 
         const lowerCandidate = candidate.toLowerCase();
         const couldBeOpening = OPEN_TAGS.some(tag => `<${tag}>`.startsWith(lowerCandidate));
-        if (couldBeOpening) return output;
+        if (couldBeOpening) {
+          if (this.removedHiddenBlock) {
+            this.buffer = candidate;
+          } else if (leadingWhitespace > MAX_PROBE_CHARS) {
+            const releasedLength = leadingWhitespace - MAX_PROBE_CHARS;
+            output += this.buffer.slice(0, releasedLength);
+            this.buffer = this.buffer.slice(releasedLength);
+          }
+          return output;
+        }
 
         this.state = 'visible';
         output += this.removedHiddenBlock ? candidate : this.buffer;
