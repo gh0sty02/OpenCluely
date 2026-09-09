@@ -26,6 +26,11 @@
     let renderedAnswer = '';
     let renderedQuestion = null;
     let historyKey = '';
+    // Per-viewer UI preference, not app state: kept in localStorage rather
+    // than the shared session snapshot so it doesn't reset when the window
+    // reloads and doesn't need to round-trip through the main process.
+    let historyHidden = false;
+    try { historyHidden = localStorage.getItem('interviewHistoryHidden') === 'true'; } catch (_) { /* private/blocked storage */ }
 
     // Only one renderer window may own the real audio capture (getDisplayMedia/
     // getUserMedia): the main overlay (body.interview-shell). Other windows
@@ -60,14 +65,14 @@
             <label class="interview-source"><span class="sr-only">Listening mode</span><select id="interviewAutoAnswer"><option value="manual">Manual</option><option value="auto">Automatic</option></select></label>
             <label class="interview-source" id="interviewSilenceGapWrap"><span class="sr-only">Pause before answering</span><select id="interviewSilenceGap"><option value="2500">Responsive (2.5s)</option><option value="3000">Balanced (3s)</option><option value="4500">Patient (4.5s)</option></select></label>
             <meter id="interviewLevel" min="0" max="1" value="0" aria-label="Audio input level"></meter>
-            ${panel ? '<button class="interview-button" data-action="end">End session</button><button class="interview-button" data-action="settings">Settings</button>' : ''}
+            ${panel ? '<button class="interview-button" data-action="end">End session</button><button class="interview-button" data-action="toggle-history">Hide history</button><button class="interview-button" data-action="settings">Settings</button>' : ''}
         </div>
         <div class="interview-status" role="status"><span id="captureStatus">Audio off</span><span id="turnStatus" hidden></span><span id="answerStatus">Ready for a question</span></div>
         ${panel ? `<div class="interview-mode-row"><label for="interviewMode">Answer style</label><select id="interviewMode"><option value="interview">Auto interview</option><option value="general">General</option><option value="system-design">System design</option><option value="dsa">Coding</option><option value="behavioral">Behavioral</option><option value="code-explanation">Code explanation</option><option value="aptitude">Aptitude</option></select></div>
         <p class="interview-notice" id="interviewNotice" role="alert" hidden></p>
         <section class="interview-question"><h2>Your question</h2><p id="interviewQuestion">Start listening to capture a question, or type one below.</p><textarea id="interviewEdit" aria-label="Edit question" rows="3" hidden></textarea><div class="interview-actions"><button class="interview-button" data-action="answer-now" disabled>Answer now</button><button class="interview-button" data-action="edit" disabled>Edit question</button><button class="interview-button" data-action="retry" disabled>Retry answer</button><button class="interview-button" data-action="stop-answer" disabled>Stop answer</button></div></section>
         <article class="interview-answer" id="interviewAnswer" aria-label="Interview answer"><p class="interview-empty">A clear opening, then the details you need.</p></article>
-        <details class="interview-history"><summary id="historySummary">Earlier questions (0)</summary><div id="interviewHistory"></div></details>` : ''}`;
+        <details class="interview-history" id="interviewHistoryBlock"><summary id="historySummary">Earlier questions (0)</summary><div id="interviewHistory"></div></details>` : ''}`;
 
     const find = id => document.getElementById(id);
     async function action(name, payload = {}) {
@@ -87,6 +92,12 @@
         const current = ui.viewState(snapshot).current;
         const name = button.dataset.action;
         if (name === 'settings') { api.showSettings?.(); return; }
+        if (name === 'toggle-history') {
+            historyHidden = !historyHidden;
+            try { localStorage.setItem('interviewHistoryHidden', String(historyHidden)); } catch (_) { /* private/blocked storage */ }
+            render(snapshot);
+            return;
+        }
         if (name === 'capture') {
             await action(ui.viewState(snapshot).captureActive ? 'pause' : snapshot.captureState === 'paused' ? 'resume' : 'start');
         } else if (name === 'edit') {
@@ -193,6 +204,9 @@
             renderedQuestion = current?.id || null;
             answer.innerHTML = renderedAnswer ? ui.renderMarkdown(renderedAnswer) : '<p class="interview-empty">Your answer will appear here.</p>';
         }
+        const historyToggle = host.querySelector('[data-action="toggle-history"]');
+        if (historyToggle) historyToggle.textContent = historyHidden ? 'Show history' : 'Hide history';
+        find('interviewHistoryBlock').hidden = historyHidden;
         const nextHistoryKey = JSON.stringify(state.history.map(question => [question.id, question.state, question.answer]));
         if (historyKey !== nextHistoryKey) {
             historyKey = nextHistoryKey;

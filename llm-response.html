@@ -15,7 +15,13 @@
         .mr-2 { margin-right: 0.5rem; }
 
         body {
-            background: linear-gradient(135deg, rgba(0, 0, 0, 0.4) 0%, rgba(20, 20, 20, 0.5) 100%);;
+            /* This window floats over arbitrary screen content (a shared
+               screen, an IDE, a bright slide deck), so the previous
+               near-transparent background left white text unreadable
+               whenever something light-colored was behind it. A darker,
+               more opaque backing plus a strong blur keeps the text legible
+               regardless of what's underneath. */
+            background: linear-gradient(135deg, rgba(10, 10, 14, 0.72) 0%, rgba(18, 18, 22, 0.8) 100%);
             -webkit-app-region: no-drag;
             color: white;
             margin: 0;
@@ -23,6 +29,7 @@
             overflow: hidden;
             height: 100vh;
             width: 100vw;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
         }
         .content-area {
             -webkit-app-region: no-drag;
@@ -102,7 +109,12 @@
 
         /* Panel improvements with proper scrolling */
         .text-panel, .code-panel {
-            background: transparent;
+            /* Split (side-by-side) layout had no backing at all, unlike
+               .full-content-inner below, so it was even harder to read. */
+            background: rgba(12, 12, 16, 0.62);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
+            border-radius: 0.5rem;
             overflow: hidden;
             position: relative;
             min-height: 0; /* Important for grid items */
@@ -128,8 +140,13 @@
 
         .full-content-inner {
             height: 100%;
-            background-color: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
+            /* A near-white 5% tint does nothing for contrast against a
+               bright backdrop (white text on white-tinted-white). A dark
+               tint plus a stronger blur keeps white text readable no
+               matter what's behind this window. */
+            background-color: rgba(12, 12, 16, 0.62);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
             border-radius: 0.5rem;
             border: 1px solid rgba(255, 255, 255, 0.1);
             overflow-y: auto;

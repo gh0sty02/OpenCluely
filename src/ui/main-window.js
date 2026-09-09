@@ -276,9 +276,11 @@ class MainWindowUI {
                 // just the bar's height and everything below is clipped.
                 const naturalHeight = Math.max(height, Math.ceil(document.body.scrollHeight));
 
-                // Cap so a very long answer doesn't grow the window past the
-                // screen; content beyond this scrolls inside #interviewWorkspace.
-                const maxHeight = Math.round((window.screen.availHeight || 900) * 0.75);
+                // Cap so the window stays a compact dialog instead of
+                // growing toward full screen height; content beyond this
+                // scrolls inside #interviewWorkspace (which already has
+                // overflow:auto) rather than the window itself growing.
+                const maxHeight = Math.round((window.screen.availHeight || 900) * 0.55);
                 height = Math.min(naturalHeight, maxHeight);
 
                 // index.html's body is `height: fit-content` (see resolveEnvPath
