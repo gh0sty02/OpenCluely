@@ -119,14 +119,11 @@ const SessionController = require("./src/interview/session-controller");
 const LatencyMetrics = require("./src/interview/latency-metrics");
 const { promptLoader } = require("./prompt-loader");
 
-const AUTO_ANSWER_SILENCE_PRESETS = new Set([2500, 3000, 4500]);
-const getAutoAnswerDefault = () => process.env.AUTO_ANSWER === undefined
-  ? true
-  : process.env.AUTO_ANSWER === "true";
-const getAutoAnswerSilenceMs = () => {
-  const configured = Number(process.env.AUTO_ANSWER_SILENCE_MS);
-  return AUTO_ANSWER_SILENCE_PRESETS.has(configured) ? configured : 3000;
-};
+const {
+  getAutoAnswerDefault,
+  getAutoAnswerSilenceMs,
+  coerceAutoAnswerPreset,
+} = require("./src/core/auto-answer-config");
 
 class ApplicationController {
   constructor() {
@@ -510,9 +507,18 @@ class ApplicationController {
     });
 
     speechService.on("transcription", (text, metadata = {}) => {
-      if (!isCurrentInterviewCapture(metadata)) return;
       const fragment = (text || "").trim();
       if (!fragment) return;
+      if (!isCurrentInterviewCapture(metadata)) {
+        // Speech captured outside the interview flow (main overlay mic
+        // button, chat window mic control, Alt+Shift+R shortcut) never has
+        // an active interview capture session, so it will never match
+        // isCurrentInterviewCapture(). Route it through the standalone
+        // voice-to-answer path instead of dropping it silently — see
+        // processVoiceTranscription().
+        this.processVoiceTranscription(fragment);
+        return;
+      }
       this.interviewController.acceptTranscript({
         sessionId: this._interviewCaptureSessionId,
         captureId: metadata.captureId,
@@ -638,10 +644,11 @@ class ApplicationController {
             break;
           case "set-auto-answer": {
             const enabled = Boolean(payload.enabled);
-            const requestedSilenceMs = Number(payload.silenceMs);
-            const silenceMs = AUTO_ANSWER_SILENCE_PRESETS.has(requestedSilenceMs)
-              ? requestedSilenceMs
-              : 3000;
+            // The settings UI dropdown only offers the three named presets —
+            // a narrower UI-only constraint, distinct from getAutoAnswerSilenceMs()
+            // (used for the .env value at startup), which honors any explicit
+            // positive value. See src/core/auto-answer-config.js.
+            const silenceMs = coerceAutoAnswerPreset(payload.silenceMs);
             this.interviewController.setAutoAnswer(enabled, silenceMs);
             this.persistEnvUpdates({
               AUTO_ANSWER: enabled ? "true" : "false",
@@ -1410,11 +1417,111 @@ class ApplicationController {
   }
 
   /**
-   * Buffer a transcribed fragment and (re)arm the coalesce debounce. Fragments
-   * are shown in the UI immediately so speech feels live, but the LLM is only
-   * asked once the speaker has actually paused — this is what stops one spoken
-   * line from producing two separate, slow answers.
+   * Standalone (non-interview) speech-to-answer path used by the main
+   * overlay's mic button, the chat window's mic control, and the
+   * Alt+Shift+R global shortcut. None of these set an active interview
+   * capture session (`_interviewCaptureSessionId`/`_interviewCaptureId`
+   * stay null), so their transcripts never match `isCurrentInterviewCapture`
+   * and would otherwise be dropped silently by the interview-routed
+   * `transcription` handler above. This mirrors the pre-interview-flow
+   * `processTranscriptionWithLLM` behavior: it streams the answer through
+   * `llmService.processTranscriptionWithIntelligentResponseStream` (kept
+   * working and signature-compatible for exactly this) to whichever voice
+   * targets the user has configured (`WHISPER_RESPONSE_TARGET` — chat
+   * window and/or the floating response overlay).
    */
+  async processVoiceTranscription(text) {
+    const cleanText = typeof text === "string" ? text.trim() : "";
+    if (!cleanText || cleanText.length < 2) return;
+
+    let messageId = null;
+    try {
+      sessionManager.addUserInput(cleanText, "speech");
+      this.sendToVoiceResponseWindows("transcription-received", { text: cleanText });
+
+      const sessionHistory = sessionManager.getOptimizedHistory();
+      const skillsRequiringProgrammingLanguage = ["dsa", "code-explanation"];
+      const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
+
+      this._responseSeq = (this._responseSeq || 0) + 1;
+      messageId = `tr-${Date.now()}-${this._responseSeq}`;
+      this.sendToVoiceResponseWindows("transcription-llm-response-start", {
+        messageId,
+        skill: this.activeSkill
+      });
+      if (this.shouldShowVoiceOverlay()) {
+        windowManager.showLLMLoading();
+      }
+
+      const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
+        cleanText,
+        this.activeSkill,
+        sessionHistory.recent,
+        needsProgrammingLanguage ? this.codingLanguage : null,
+        (delta) => {
+          this.sendToVoiceResponseWindows("transcription-llm-response-chunk", { messageId, delta });
+        }
+      );
+      llmResult.metadata = { ...llmResult.metadata, messageId };
+
+      sessionManager.addModelResponse(llmResult.response, {
+        skill: this.activeSkill,
+        processingTime: llmResult.metadata.processingTime,
+        usedFallback: llmResult.metadata.usedFallback,
+        isTranscriptionResponse: true
+      });
+
+      this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
+      if (this.shouldShowVoiceOverlay()) {
+        windowManager.showLLMResponse(llmResult.response, {
+          skill: this.activeSkill,
+          processingTime: llmResult.metadata.processingTime,
+          usedFallback: llmResult.metadata.usedFallback,
+          isTranscriptionResponse: true
+        });
+      }
+    } catch (error) {
+      logger.error("Voice transcription LLM processing failed", {
+        error: error.message,
+        skill: this.activeSkill
+      });
+
+      try {
+        const fallbackResult = typeof llmService.generateIntelligentFallbackResponse === "function"
+          ? llmService.generateIntelligentFallbackResponse(cleanText, this.activeSkill)
+          : null;
+        if (!fallbackResult) throw error;
+
+        if (messageId) fallbackResult.metadata = { ...fallbackResult.metadata, messageId };
+        sessionManager.addModelResponse(fallbackResult.response, {
+          skill: this.activeSkill,
+          processingTime: fallbackResult.metadata.processingTime,
+          usedFallback: true,
+          isTranscriptionResponse: true,
+          fallbackReason: error.message
+        });
+
+        this.sendTranscriptionLLMResponseToVoiceTargets(fallbackResult);
+        if (this.shouldShowVoiceOverlay()) {
+          windowManager.showLLMResponse(fallbackResult.response, {
+            skill: this.activeSkill,
+            processingTime: fallbackResult.metadata.processingTime,
+            usedFallback: true,
+            isTranscriptionResponse: true
+          });
+        }
+      } catch (fallbackError) {
+        logger.error("Voice transcription fallback also failed", {
+          error: fallbackError.message
+        });
+        if (this.shouldShowVoiceOverlay()) {
+          windowManager.hideLLMResponse();
+        }
+        this.broadcastLLMError(error.message);
+      }
+    }
+  }
+
   /**
    * `generate` dependency for the interview session controller. Composes the
    * interview prompt (shared policy + bounded recent Q&A history) and streams
