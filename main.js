@@ -116,6 +116,7 @@ const sessionManager = require("./src/managers/session.manager");
 
 // Interview session coordinator and shared prompt composition
 const SessionController = require("./src/interview/session-controller");
+const LatencyMetrics = require("./src/interview/latency-metrics");
 const { promptLoader } = require("./prompt-loader");
 
 const AUTO_ANSWER_SILENCE_PRESETS = new Set([2500, 3000, 4500]);
@@ -136,10 +137,16 @@ class ApplicationController {
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
 
+    // Content-free latency diagnostics: bounded per-question stage timing
+    // (speech end, transcript ready, question committed, first visible
+    // token, completion) with no prompt/transcript/answer text ever stored.
+    this.latencyMetrics = new LatencyMetrics();
+
     // Interview session coordinator: owns finalized-question queueing,
     // turn detection, deduplication, and answer generation for the panel UI.
     this.interviewController = new SessionController({
       generate: (question, options) => this.generateInterviewAnswer(question, options),
+      metrics: this.latencyMetrics,
     });
     this.interviewController.setAutoAnswer(
       getAutoAnswerDefault(),
@@ -1427,6 +1434,14 @@ class ApplicationController {
       activeSkill: this.interviewController.mode,
       programmingLanguage: this.codingLanguage,
       history,
+    });
+    // Feed the provider/model this request is actually using into the
+    // latency record the session controller already opened for this
+    // question (content-free: just the provider class name and model id).
+    this.latencyMetrics.annotate(question.id, {
+      provider: llmService.constructor && llmService.constructor.name,
+      model: llmService.model,
+      source: question.source,
     });
     try {
       const result = await llmService.generateAnswer({ messages, signal, onDelta });

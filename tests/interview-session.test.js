@@ -1,6 +1,23 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+
+// LatencyMetrics (pulled in below) logs through src/core/logger — stub it
+// the same way tests/interview-prompts.test.js and
+// tests/provider-streaming.test.js do, so these tests don't touch disk.
+const loggerPath = require.resolve('../src/core/logger');
+require.cache[loggerPath] = {
+  id: loggerPath,
+  filename: loggerPath,
+  loaded: true,
+  exports: {
+    createServiceLogger: () => ({
+      debug() {}, info() {}, warn() {}, error() {}, logPerformance() {}
+    })
+  }
+};
+
 const SessionController = require('../src/interview/session-controller');
+const LatencyMetrics = require('../src/interview/latency-metrics');
 
 function setup() {
   let tick = 0;
@@ -314,4 +331,146 @@ test('stop answer aborts only that attempt and proceeds to a finalized queued qu
   assert.equal(calls[0].options.signal.aborted, true);
   assert.equal(calls.length, 2);
   assert.equal(controller.snapshot().questions[0].state, 'cancelled');
+});
+
+function setupTurnLifecycleWithMetrics({ source = 'system' } = {}) {
+  const clock = createClock(1000);
+  const metrics = new LatencyMetrics();
+  const calls = [];
+  const controller = new SessionController({
+    generate: (question, options) => new Promise((resolve, reject) => calls.push({ question, options, resolve, reject })),
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    metrics
+  });
+  controller.startSession({ source });
+  controller.setAutoAnswer(true, 3000);
+  controller.beginCapture(7);
+  const settleTranscript = (text, utteranceId, speechEndedAt) => {
+    controller.noteSpeechEnded({ captureId: 7, utteranceId, speechEndedAt });
+    controller.noteTranscriptionStarted({ captureId: 7, utteranceId, speechEndedAt });
+    controller.acceptTranscript({
+      sessionId: controller.sessionId, captureId: 7, source, final: true,
+      utteranceId, speechEndedAt, text
+    });
+    controller.noteTranscriptionSettled({ captureId: 7, utteranceId, speechEndedAt, text, errorCode: null });
+  };
+  return { clock, controller, calls, metrics, settleTranscript };
+}
+
+test('latency metrics: a spoken turn records transcription, endpoint wait, first-token, and total durations', async () => {
+  const { clock, controller, calls, metrics } = setupTurnLifecycleWithMetrics();
+  // Drive the acoustic lifecycle by hand (not via the atomic settleTranscript
+  // helper) so real elapsed time separates "speech ended", "transcript
+  // ready", and "turn committed" — matching how the app actually runs.
+  controller.noteSpeechEnded({ captureId: 7, utteranceId: 'u1', speechEndedAt: 1000 });
+  controller.noteTranscriptionStarted({ captureId: 7, utteranceId: 'u1', speechEndedAt: 1000 });
+  clock.advance(300); // transcription work takes 300ms
+  controller.acceptTranscript({
+    sessionId: controller.sessionId, captureId: 7, source: 'system', final: true,
+    utteranceId: 'u1', speechEndedAt: 1000, text: 'Explain recursion'
+  });
+  controller.noteTranscriptionSettled({ captureId: 7, utteranceId: 'u1', speechEndedAt: 1000, text: 'Explain recursion', errorCode: null });
+  clock.advance(2700); // the remaining silence deadline (total 3000ms) commits the turn at t=4000
+  assert.equal(calls.length, 1);
+  clock.advance(500); // provider takes 500ms to the first visible token
+  calls[0].options.onDelta('Recursion is');
+  clock.advance(700); // and 700ms more to finish
+  calls[0].resolve({ response: 'Recursion is a function calling itself.' });
+  await new Promise(resolve => setImmediate(resolve));
+
+  const summary = metrics.getSummary();
+  assert.equal(summary.count, 1);
+  assert.equal(summary.transcriptionMs.p50, 300);
+  assert.equal(summary.endpointWaitMs.p50, 2700);
+  assert.equal(summary.firstTokenMs.p50, 500);
+  assert.equal(summary.totalMs.p50, 4200);
+});
+
+test('latency metrics: a typed question has no acoustic stages but still records commitment onward', async () => {
+  const clock = createClock(1000);
+  const metrics = new LatencyMetrics();
+  const calls = [];
+  const controller = new SessionController({
+    generate: (question, options) => new Promise((resolve, reject) => calls.push({ question, options, resolve, reject })),
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, metrics
+  });
+  controller.startSession();
+  controller.submit('What is Big O?', 'typed');
+  clock.advance(400);
+  calls[0].options.onDelta('Big O notation');
+  clock.advance(600);
+  calls[0].resolve({ response: 'Big O notation describes growth.' });
+  await new Promise(resolve => setImmediate(resolve));
+
+  const summary = metrics.getSummary();
+  assert.equal(summary.count, 1);
+  assert.equal(summary.transcriptionMs.count, 0);
+  assert.equal(summary.endpointWaitMs.count, 0);
+  assert.equal(summary.firstTokenMs.p50, 400);
+});
+
+test('latency metrics: a failed answer is recorded with a sanitized error code', async () => {
+  const { controller, calls, metrics, settleTranscript } = setupTurnLifecycleWithMetrics();
+  settleTranscript('Explain queues', 'u1', 1000);
+  controller.answerNow(); // submit immediately, bypassing the silence deadline
+  assert.equal(calls.length, 1);
+  calls[0].reject(Object.assign(new Error('leaked message text should never be stored'), { code: 'NETWORK_ERROR' }));
+  await new Promise(resolve => setImmediate(resolve));
+
+  const summary = metrics.getSummary();
+  assert.equal(summary.count, 1);
+  const serialized = JSON.stringify(summary);
+  assert.equal(serialized.includes('leaked message text'), false);
+});
+
+test('latency metrics: unknown-code failures are sanitized rather than logging free text', async () => {
+  const { controller, calls, metrics, settleTranscript } = setupTurnLifecycleWithMetrics();
+  settleTranscript('Explain stacks', 'u1', 1000);
+  controller.answerNow();
+  calls[0].reject(new Error('The transcript said something private'));
+  await new Promise(resolve => setImmediate(resolve));
+  // getSummary() only reports aggregate durations (no per-record error code),
+  // so assert indirectly: the controller's own question error message is
+  // untouched (still shown to the user) while metrics stayed content-free.
+  assert.match(controller.snapshot().questions[0].error, /transcript said something private/);
+  assert.equal(metrics.getSummary().count, 1);
+});
+
+test('latency metrics: a question cancelled while still queued closes out its record instead of leaking', () => {
+  const clock = createClock(1000);
+  const metrics = new LatencyMetrics();
+  const calls = [];
+  const controller = new SessionController({
+    generate: (question, options) => new Promise((resolve, reject) => calls.push({ question, options, resolve, reject })),
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, metrics
+  });
+  controller.startSession();
+  controller.submit('First?', 'typed'); // becomes active immediately
+  controller.submit('Second?', 'typed'); // stays queued behind the first
+  const queuedId = controller.snapshot().questions[1].id;
+  controller.stopAnswer(queuedId);
+  assert.equal(controller.snapshot().questions[1].state, 'cancelled');
+  // The queued question's record was closed (not left dangling in `active`):
+  // getSummary() reflects it, and completing it again is a safe no-op.
+  assert.equal(metrics.getSummary().count, 1);
+  assert.equal(metrics.complete(queuedId, clock.now()), null);
+});
+
+test('latency metrics: endSession closes out every still-queued record', () => {
+  const clock = createClock(1000);
+  const metrics = new LatencyMetrics();
+  const calls = [];
+  const controller = new SessionController({
+    generate: (question, options) => new Promise((resolve, reject) => calls.push({ question, options, resolve, reject })),
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, metrics
+  });
+  controller.startSession();
+  controller.submit('First?', 'typed');
+  controller.submit('Second?', 'typed');
+  controller.submit('Third?', 'typed');
+  controller.endSession();
+  // One active answer plus two queued ones — all three should be closed out.
+  assert.equal(metrics.getSummary().count, 3);
 });

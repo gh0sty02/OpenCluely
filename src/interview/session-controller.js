@@ -8,9 +8,11 @@ const TurnDetector = require('./turn-detector');
 // draft immediately. Automatic submission waits for the acoustic detector to
 // observe drained transcription work and a complete silence window.
 class SessionController extends EventEmitter {
-  constructor({ generate, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  constructor({ generate, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, metrics = null } = {}) {
     super();
     this.generate = generate;
+    this.now = now;
+    this.metrics = metrics;
     this.source = 'system';
     this.mode = 'interview';
     this.sessionId = randomUUID();
@@ -26,6 +28,18 @@ class SessionController extends EventEmitter {
     this.autoAnswer = false;
     this.autoAnswerSilenceMs = 3000;
     this.activeCaptureId = null;
+    // Content-free latency diagnostics: the acoustic pipeline's speech-ended
+    // and transcript-ready moments for the *current* turn, captured as they
+    // happen (not deferred to submit time, since turnDetector.cancel() —
+    // called from answerNow() before submit() — would already have wiped
+    // them) so LatencyMetrics can measure real transcription and
+    // silence-wait durations.
+    this._pendingSpeechEndedAt = null;
+    this._pendingTranscriptReadyAt = null;
+    // Count of questions this session has already answered successfully,
+    // used only as the content-free "warm" signal (first request vs. a
+    // follow-up on an already-established provider connection).
+    this._answeredCount = 0;
     this.turnDetector = new TurnDetector({
       silenceMs: this.autoAnswerSilenceMs,
       now,
@@ -70,12 +84,38 @@ class SessionController extends EventEmitter {
   beginCapture(captureId) {
     if (!Number.isFinite(captureId)) return;
     this.activeCaptureId = captureId;
+    this._pendingSpeechEndedAt = null;
+    this._pendingTranscriptReadyAt = null;
     this.turnDetector.begin({ sessionId: this.sessionId, captureId });
   }
-  noteSpeechStarted(event) { this.turnDetector.noteSpeechStarted(event); }
-  noteSpeechEnded(event) { this.turnDetector.noteSpeechEnded(event); }
+  noteSpeechStarted(event) {
+    // A fresh utterance invalidates any transcript-ready mark left over from
+    // an earlier utterance in this turn — the turn isn't done yet.
+    const wasActive = this.turnDetector.snapshot().speakerActive;
+    this.turnDetector.noteSpeechStarted(event);
+    if (!wasActive && this.turnDetector.snapshot().speakerActive) this._pendingTranscriptReadyAt = null;
+  }
+  noteSpeechEnded(event) {
+    this.turnDetector.noteSpeechEnded(event);
+    // Mirror the turn detector's own (max-tracked) speechEndedAt onto the
+    // controller immediately, because answerNow() calls turnDetector.cancel()
+    // — which clears it — before submit() runs. Reading it lazily at submit
+    // time would see null instead of the acoustic layer's real timestamp.
+    const speechEndedAt = this.turnDetector.snapshot().speechEndedAt;
+    if (Number.isFinite(speechEndedAt)) this._pendingSpeechEndedAt = speechEndedAt;
+  }
   noteTranscriptionStarted(event) { this.turnDetector.noteTranscriptionStarted(event); }
-  noteTranscriptionSettled(event) { this.turnDetector.noteTranscriptionSettled(event); }
+  noteTranscriptionSettled(event) {
+    const pendingBefore = this.turnDetector.snapshot().pendingTranscriptions;
+    this.turnDetector.noteTranscriptionSettled(event);
+    const after = this.turnDetector.snapshot();
+    // Content-free latency mark: the moment the *last* pending transcription
+    // job settles (not every settle — only the transition to zero pending
+    // while nobody is speaking) is "transcript ready" for this turn.
+    if (pendingBefore > 0 && after.pendingTranscriptions === 0 && !after.speakerActive) {
+      this._pendingTranscriptReadyAt = this.now();
+    }
+  }
 
   startSession({ source = this.source, mode = this.mode } = {}) {
     this.clearSession();
@@ -95,7 +135,7 @@ class SessionController extends EventEmitter {
     this.activeCaptureId = null;
     this.turnDetector.cancel();
     this._cancelActive();
-    this.queue.forEach(q => { q.state = 'cancelled'; });
+    this.queue.forEach(q => this._cancelQueued(q));
     this.queue = [];
     this.sessionId = randomUUID();
     this.seen.clear();
@@ -138,6 +178,18 @@ class SessionController extends EventEmitter {
     if (typeof text !== 'string' || !text.trim()) throw new Error('Enter a question first.');
     if (text.length > 20000) throw new Error('Keep the question under 20,000 characters.');
     const q = { id: randomUUID(), text: text.trim(), source, state: 'queued', answer: '', error: '', requestId: null };
+    // Question commitment, marked before the question enters the answer
+    // queue. Only a spoken turn carries acoustic stages (speechEndedAt /
+    // transcriptReadyAt) — a typed question has neither.
+    if (this.metrics) {
+      const speechEndedAt = source === 'typed' ? null : this._pendingSpeechEndedAt;
+      const transcriptReadyAt = source === 'typed' ? null : this._pendingTranscriptReadyAt;
+      this.metrics.begin(q.id, { speechEndedAt, source, warm: this._answeredCount > 0 });
+      if (Number.isFinite(transcriptReadyAt)) this.metrics.mark(q.id, 'transcriptReadyAt', transcriptReadyAt);
+      this.metrics.mark(q.id, 'questionCommittedAt', this.now());
+    }
+    this._pendingSpeechEndedAt = null;
+    this._pendingTranscriptReadyAt = null;
     this.questions.push(q);
     // Keep completed history bounded without discarding pending questions.
     while (this.questions.length > 100) {
@@ -160,15 +212,29 @@ class SessionController extends EventEmitter {
     if (!q || !['error', 'cancelled', 'overflow', 'completed'].includes(q.state)) return;
     if (this.queue.length >= 3) throw new Error('The answer queue is full. Try again after an answer completes.');
     q.state = 'queued'; q.error = ''; q.answer = ''; q.requestId = null;
+    // A retry has no fresh acoustic stages of its own — track only
+    // commitment onward.
+    if (this.metrics) {
+      this.metrics.begin(q.id, { source: q.source, warm: this._answeredCount > 0 });
+      this.metrics.mark(q.id, 'questionCommittedAt', this.now());
+    }
     this.queue.push(q); this.publish(); this._pump();
   }
   stopAnswer(questionId) {
     if (this.active?.question.id === questionId) this._cancelActive();
     else {
       const q = this.queue.find(item => item.id === questionId);
-      if (q) { q.state = 'cancelled'; this.queue = this.queue.filter(item => item !== q); }
+      if (q) { this._cancelQueued(q); this.queue = this.queue.filter(item => item !== q); }
     }
     this.publish(); this._pump();
+  }
+  // A queued (not yet generating) question was cancelled before it ever
+  // reached _pump() — close out its latency record with the same
+  // content-free 'CANCELLED' terminal event an aborted in-flight answer
+  // gets, instead of leaving it to expire silently out of the active ring.
+  _cancelQueued(q) {
+    q.state = 'cancelled';
+    if (this.metrics) this.metrics.fail(q.id, this.now(), 'CANCELLED');
   }
   _commitReadyTurn(event) {
     if (!this.autoAnswer || this.source === 'microphone') return;
@@ -188,6 +254,12 @@ class SessionController extends EventEmitter {
     const active = this.active;
     this.active = null;
     active.question.state = 'cancelled';
+    // The generate() promise's own .catch() guards on isCurrent(), which is
+    // already false the instant `this.active` is cleared above — so its
+    // eventual (possibly late) settlement will never reach the metrics
+    // terminal marks below. Record cancellation here, at the moment the
+    // controller itself decided the turn was over.
+    if (this.metrics) this.metrics.fail(active.question.id, this.now(), 'CANCELLED');
     active.abort.abort();
   }
   _pump() {
@@ -203,6 +275,10 @@ class SessionController extends EventEmitter {
     const isCurrent = () => this.active === attempt && this.sessionId === attempt.sessionId;
     const onDelta = delta => {
       if (!isCurrent() || typeof delta !== 'string') return;
+      // First visible token: the first non-empty delta reaching here has
+      // already passed through the provider's VisibleAnswerFilter, so this
+      // is exactly the moment the answer became visible to the user.
+      if (this.metrics && delta && !question.answer) this.metrics.mark(question.id, 'firstVisibleTokenAt', this.now());
       question.answer += delta;
       this.publish();
     };
@@ -215,11 +291,14 @@ class SessionController extends EventEmitter {
       if (!text?.trim()) throw Object.assign(new Error('The model returned no answer. Retry this question.'), { code: 'EMPTY_RESPONSE' });
       question.answer = text;
       question.state = 'completed';
+      this._answeredCount++;
+      if (this.metrics) this.metrics.complete(question.id, this.now());
       this.emit('answer', { ...question });
     }).catch(error => {
       if (!isCurrent()) return;
       question.state = error.code === 'CANCELLED' ? 'cancelled' : 'error';
       question.error = error.message || 'The answer could not be completed. Try again.';
+      if (this.metrics) this.metrics.fail(question.id, this.now(), error.code);
     }).finally(() => {
       if (!isCurrent()) return;
       this.active = null;
