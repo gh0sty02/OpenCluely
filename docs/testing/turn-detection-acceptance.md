@@ -37,7 +37,7 @@ synthesizes them.
 | Continuous question | 0.5 s | 1 | Not exercised by an automated test at exactly 0.5 s. Structurally, a 0.5 s gap is below `speech.service.js`'s default 700 ms VAD silence hangover (`WHISPER_SILENCE_HANGOVER_MS`, `src/services/speech.service.js:1499`), so it would not even produce two separate transcription segments at the VAD layer, let alone two questions. The general "one settled transcript yields one submitted question" behavior is covered by `tests/interview-session.test.js:151` ("Answer now submits immediately while the acoustic deadline is pending"). **Verified deterministically only in the general case, not at the specific 0.5 s boundary. Requires live audio for the literal case.** |
 | Natural planning pause | 2.0 s | 1 | **Verified deterministically.** `tests/interview-session.test.js:100` ("a two-second planning pause remains one automatically submitted question") drives exactly this: two speech segments separated by a 2000 ms gap, settling into one combined draft, with one `generationCalls` entry only once the full 3000 ms silence deadline elapses. Also covered at the detector level by `tests/turn-detector.test.js:71` ("the newest acoustic boundary owns the deadline after a natural pause"). |
 | Boundary margin | 2.8 s | 1 | **Verified deterministically, as a superset.** Neither test uses exactly 2.8 s; both `tests/turn-detector.test.js:71` and `tests/interview-session.test.js:100` advance the clock to `silenceMs - 1` (2999 ms) and assert zero generation/ready events, then advance the final 1 ms and assert exactly one. This proves the boundary holds for every pause up to and including 2.8 s (a subset of what is tested), not only for 2.8 s specifically. |
-| Separate question | 4.0 s | 2 | **Not directly verified.** No test in `tests/turn-detector.test.js` or `tests/interview-session.test.js` drives a full turn-lifecycle silence deadline (a pause past the 3000 ms window with no further speech) followed by a second independent turn and asserts two separate auto-submitted questions. The closest indirect coverage: `tests/turn-detector.test.js:61` ("a silence deadline waits for the final pending transcription") proves a `ready` event fires once a turn's silence window elapses, and `tests/interview-session.test.js:182` ("duplicate final identities are ignored but repeated questions are allowed") proves two sequential submitted questions remain distinct in session state, but that test drives submission manually (`answerNow()`/`flush()`), not via the real 4 s turn-detector timing. **This row requires either a new deterministic test or the live audio fixture to be fully covered.** |
+| Separate question | 4.0 s | 2 | **Verified deterministically.** `tests/interview-session.test.js` ("two questions separated by a full silence deadline are auto-submitted as two independent turns") drives a full turn-lifecycle silence deadline via the real turn-detector timing (`clock.advance(3000)` past the pause, with no further speech), asserts exactly one auto-submitted question, resolves that answer so the controller's single active-generation slot frees up, then drives a second, fully independent turn (its own speech end and a fresh deadline) and asserts a second, distinct question. Live confirmation with real audio (Step 5) was still not performed. |
 | Slow second transcription | 2.0 s | 1 | **Verified deterministically.** `tests/turn-detector.test.js:61` ("a silence deadline waits for the final pending transcription") proves the ready/generation event is withheld until a pending transcription settles, even after the silence deadline's nominal time has passed. |
 
 Live confirmation with real audio (Step 5 of the plan) was not performed; see
@@ -101,6 +101,16 @@ Syntax checked 51 JavaScript files; 0 failures.
 
 51 files, 0 syntax failures. Both match the plan's Step 4 expectation of zero
 failed tests and zero syntax failures.
+
+**Update (final whole-branch review fix pass):** the review that gated
+finishing this branch found five findings (see the fix commits on
+`feat/openrouter-provider` following `2f63a3f`), one of which was the
+"Separate question" row above having no direct test. Fixing that, plus a
+latency-metrics regression test and an auto-answer-config test suite added
+during the same pass, brought `npm.cmd test` to **130/130 passed** and
+`npm.cmd run check` to **53/53 files, 0 syntax failures**. The commands and
+their pass/fail status are unchanged in kind from the run above; only the
+counts moved.
 
 ## Live UI smoke check (attempted, succeeded)
 
@@ -189,9 +199,9 @@ perform in this session.
 | Plan step | Status |
 | --- | --- |
 | 1. Audio fixture provenance documented | Done (`tests/fixtures/audio/README.md`); no actual audio files, by design (no recording/synthesis capability here). |
-| 2. Pause scenarios | Deterministically verified for continuous (partially, general case only), natural pause, boundary margin (as a superset), and slow second transcription. The separate-question (4.0 s, 2 questions) row is not directly covered by an existing test. Live confirmation not run. |
+| 2. Pause scenarios | Deterministically verified for continuous (partially, general case only), natural pause, boundary margin (as a superset), slow second transcription, and separate question (all five rows). Live confirmation not run. |
 | 3. Reasoning-output fixtures | Fully verified deterministically across all five required cases. |
-| 4. Deterministic verification | Run for real this session: 122/122 tests passed, 51/51 files syntax-clean. |
+| 4. Deterministic verification | Run for real this session: 130/130 tests passed, 53/53 files syntax-clean. |
 | 5. Live system-audio interview | Not run: no audio hardware in this environment. |
 | 6. Warm/cold latency measurement | Not run: requires Step 5 plus a configured, live-answering provider. |
 | 7. Windows package build | Not run, by instruction: too long-running/resource-heavy and needs human verification. |
@@ -199,8 +209,6 @@ perform in this session.
 
 Whoever continues this plan on real hardware should, in order: (1) record
 the five audio fixtures per `tests/fixtures/audio/README.md`'s provenance
-table, (2) add a deterministic turn-lifecycle test for the "separate
-question" 4.0 s row so Step 2's table has full automated coverage, (3) run
-Step 5 with real system audio and a configured provider, (4) collect the 25
-latency samples for Step 6, and (5) only then attempt `npm.cmd run
-build:win` and Step 7's clean-profile packaged verification.
+table, (2) run Step 5 with real system audio and a configured provider, (3)
+collect the 25 latency samples for Step 6, and (4) only then attempt
+`npm.cmd run build:win` and Step 7's clean-profile packaged verification.
