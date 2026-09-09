@@ -813,7 +813,16 @@ class SpeechService extends EventEmitter {
       utteranceId: speech.utteranceId,
       speechEndedAt: endedAt
     });
-    const item = { audioBuffer, lifecycle, settled: false, cancelled: false };
+    let resolveSettlement;
+    const settlement = new Promise(resolve => { resolveSettlement = resolve; });
+    const item = {
+      audioBuffer,
+      lifecycle,
+      settled: false,
+      cancelled: false,
+      settlement,
+      resolveSettlement
+    };
     this.activeSpeech = null;
     this.activeTranscriptions.set(lifecycle.utteranceId, item);
     this.emit('speech-ended', lifecycle);
@@ -830,6 +839,14 @@ class SpeechService extends EventEmitter {
       text,
       errorCode
     });
+    item.resolveSettlement();
+  }
+
+  _waitForTranscriptionDrain(captureId) {
+    const settlements = [...this.activeTranscriptions.values()]
+      .filter(item => item.lifecycle.captureId === captureId)
+      .map(item => item.settlement);
+    return Promise.all(settlements);
   }
 
   _settleActiveSpeech(errorCode, captureId = this.captureId) {
@@ -985,6 +1002,8 @@ class SpeechService extends EventEmitter {
       if (isVoiced) {
         // Speech onset: prepend the pre-roll so the first syllable survives.
         this.vadSpeaking = true;
+        // Fire immediately so compatibility consumers can hold off pending
+        // answer timers without waiting for transcription latency.
         this._beginSpeech();
         this.vadSpeechMs = 0;
         this.vadSilenceMs = 0;
@@ -997,10 +1016,6 @@ class SpeechService extends EventEmitter {
         this.segmentBuffers.push(buffer);
         this.segmentBytes += buffer.length;
         this.vadSpeechMs += chunkMs;
-        // Real-time onset signal — fires the instant speech resumes, well
-        // before this segment is transcribed, so a pending auto-answer timer
-        // can be held off without waiting on Whisper latency.
-        this.emit('speech-activity', { captureId: this.captureId });
       } else {
         // Background: adapt the noise floor and keep a short pre-roll ring.
         this.vadNoiseFloor = this.vadNoiseFloor * 0.95 + energy * 0.05;
@@ -1164,6 +1179,7 @@ class SpeechService extends EventEmitter {
 
     try {
       await this._flushWhisperSegment();
+      await this._waitForTranscriptionDrain(this.captureId);
     } catch (error) {
       logger.error('Final Whisper transcription failed', { error: error.message });
       if (!error.speechNotified) {

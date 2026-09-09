@@ -74,6 +74,38 @@ test('pause drains in-flight and buffered utterances individually with identitie
   assert.equal(speech.isProcessingAudio, false);
 });
 
+test('stop waits for in-flight and queued utterances when no final audio remains', async () => {
+  const speech = service();
+  const settlements = [];
+  let finishFirst;
+  speech.on('transcription-settled', event => settlements.push(event));
+  speech._transcribeWhisperBuffer = data => data[0] === 1
+    ? new Promise(resolve => { finishFirst = resolve; })
+    : Promise.resolve('question-2');
+  speech.startRecording();
+  buffer(speech, 1);
+  const first = speech._flushWhisperSegment(1000);
+  await Promise.resolve();
+  buffer(speech, 2);
+  const second = speech._flushWhisperSegment(2000);
+
+  let stopped = false;
+  const stopping = Promise.resolve(speech.stopRecording()).then(() => { stopped = true; });
+  await Promise.resolve();
+  const stoppedBeforeDrain = stopped;
+  finishFirst('question-1');
+  await first;
+  await stopping;
+  const queuedState = await Promise.race([
+    second.then(() => 'settled'),
+    new Promise(resolve => setTimeout(() => resolve('pending'), 0))
+  ]);
+  assert.equal(stoppedBeforeDrain, false);
+  assert.equal(queuedState, 'settled');
+  assert.equal(settlements.length, 2);
+  assert.deepEqual(settlements.map(event => event.text), ['question-1', 'question-2']);
+});
+
 test('cancel and immediate restart ignores old transcription and preserves new buffers', async () => {
   const speech = service();
   const finals = [];
@@ -109,13 +141,16 @@ test('renderer PCM is routed to Azure push stream without microphone capture', (
 test('voiced frames emit one speech start when VAD enters an utterance', async () => {
   const speech = service();
   const starts = [];
+  const activities = [];
   speech.on('speech-started', event => starts.push(event));
+  speech.on('speech-activity', event => activities.push(event));
   speech.startRecording();
   const frame = Buffer.alloc(3200);
   for (let offset = 0; offset < frame.length; offset += 2) frame.writeInt16LE(12000, offset);
   speech._ingestWhisperAudio(frame);
   speech._ingestWhisperAudio(frame);
   assert.equal(starts.length, 1);
+  assert.equal(activities.length, 1);
   assert.equal(starts[0].captureId, speech.captureId);
   assert.ok(Number.isFinite(starts[0].at));
   assert.ok(starts[0].utteranceId);
