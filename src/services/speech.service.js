@@ -849,9 +849,9 @@ class SpeechService extends EventEmitter {
     return Promise.all(settlements);
   }
 
-  _settleActiveSpeech(errorCode, captureId = this.captureId) {
+  _settleActiveSpeech(errorCode, captureId = this.captureId, speechEndedAt = Date.now()) {
     if (!this.activeSpeech || this.activeSpeech.captureId !== captureId) return;
-    const item = this._createTranscriptionItem(null, Date.now(), captureId);
+    const item = this._createTranscriptionItem(null, speechEndedAt, captureId);
     item.cancelled = true;
     this._settleTranscription(item, '', errorCode);
   }
@@ -1045,31 +1045,47 @@ class SpeechService extends EventEmitter {
     const haveRealSpeech = this.vadSpeechMs >= this._getMinUtteranceMs();
     const tooLong = this.vadSpeechMs >= this._getMaxUtteranceMs();
 
-    if ((pausedLongEnough && haveRealSpeech) || tooLong) {
+    if (pausedLongEnough && haveRealSpeech) {
+      // This flush only runs once vadSilenceMs has reached the hangover
+      // threshold, so "now" is already `_getSilenceHangoverMs()` later than
+      // the moment the speaker actually stopped talking. Back that out so
+      // the timestamp handed to the turn detector reflects real speech end,
+      // not the hangover-delayed moment this flush happened to run — see
+      // docs/testing/turn-detection-acceptance.md for why this matters (the
+      // effective auto-answer silence window is speechEndedAt + silenceMs).
+      this._endUtteranceFlush(Date.now() - this._getSilenceHangoverMs());
+    } else if (tooLong) {
+      // The speaker never paused (still actively talking through the max-
+      // utterance cap), so there is no hangover delay to correct for here.
       this._endUtteranceFlush();
     } else if (pausedLongEnough && !haveRealSpeech) {
       // Just noise (cough/click) with no real speech — discard, don't waste a
-      // Whisper spawn or risk a hallucinated transcript.
+      // Whisper spawn or risk a hallucinated transcript. Same hangover-gated
+      // timing as the flush branch above, so apply the same correction.
       this.segmentBuffers = [];
       this.segmentBytes = 0;
       this.vadSpeaking = false;
       this.vadSpeechMs = 0;
       this.vadSilenceMs = 0;
-      this._settleActiveSpeech('NO_SPEECH');
+      this._settleActiveSpeech('NO_SPEECH', this.captureId, Date.now() - this._getSilenceHangoverMs());
     }
   }
 
-  /** Flush the accumulated utterance and reset VAD for the next one. */
-  _endUtteranceFlush() {
+  /**
+   * Flush the accumulated utterance and reset VAD for the next one.
+   * @param {number} [speechEndedAt] When the speaker actually stopped
+   *   talking. Callers reached via a hangover-gated pause detection (the
+   *   normal case) must pass `Date.now() - this._getSilenceHangoverMs()`
+   *   explicitly; callers flushing for other reasons (mic stall, max-
+   *   utterance cap, fixed-window fallback) have no hangover to correct for
+   *   and can rely on the `Date.now()` default.
+   */
+  _endUtteranceFlush(speechEndedAt = Date.now()) {
     this.vadSpeaking = false;
     this.vadSpeechMs = 0;
     this.vadSilenceMs = 0;
     this.vadPreRoll = [];
     this.vadPreRollMs = 0;
-    // Captured now, before transcription work begins, so downstream
-    // silence-gap timing reflects when the speaker actually stopped talking
-    // rather than however long Whisper took to process this segment.
-    const speechEndedAt = Date.now();
     this._flushWhisperSegment(speechEndedAt).catch((error) => {
       logger.error('Whisper segment transcription failed', { error: error.message });
     });
