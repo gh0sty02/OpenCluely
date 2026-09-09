@@ -141,12 +141,22 @@ test('forceReady bypasses only the silence wait and still emits once', () => {
 
 test('the pending transcription backlog is bounded at 100 identities', () => {
   const { detector } = setup(1000);
-  const errors = [];
-  detector.on('error', error => errors.push(error));
+  const warnings = [];
+  detector.on('warning', warning => warnings.push(warning));
   for (let index = 0; index < 101; index++) {
     detector.noteTranscriptionStarted({ captureId: 7, utteranceId: `u${index}`, speechEndedAt: 1000 + index });
   }
   assert.equal(detector.snapshot().pendingTranscriptions, 100);
-  assert.equal(errors.length, 1);
-  assert.equal(errors[0].code, 'TRANSCRIPTION_BACKLOG');
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].code, 'TRANSCRIPTION_BACKLOG');
+});
+
+test('reaching the transcription backlog cap is safe without diagnostic listeners', () => {
+  const { detector } = setup(1000);
+  assert.doesNotThrow(() => {
+    for (let index = 0; index < 101; index++) {
+      detector.noteTranscriptionStarted({ captureId: 7, utteranceId: `u${index}`, speechEndedAt: 1000 + index });
+    }
+  });
+  assert.equal(detector.snapshot().pendingTranscriptions, 100);
 });

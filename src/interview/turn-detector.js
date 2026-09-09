@@ -80,7 +80,7 @@ class TurnDetector extends EventEmitter {
       const error = Object.assign(new Error('Too many transcriptions are pending.'), {
         code: 'TRANSCRIPTION_BACKLOG'
       });
-      this.emit('error', error);
+      this.emit('warning', error);
       return;
     }
     this.transcriptions.add(event.utteranceId);
