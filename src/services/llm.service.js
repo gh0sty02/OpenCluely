@@ -1,7 +1,14 @@
 const { GoogleGenAI } = require('@google/genai');
+const https = require('https');
+// Explicit Node URL, not the bare global — see the matching note in
+// openrouter.service.js: some dependency here replaces global URL with a
+// polyfill that mis-parses paths after an explicit port.
+const { URL } = require('node:url');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const { streamCompletion, geminiEvent } = require('./sse-parser');
+const VisibleAnswerFilter = require('./visible-answer-filter');
 
 class LLMService {
   constructor() {
@@ -63,16 +70,98 @@ class LLMService {
     return request;
   }
 
-  extractTextFromCandidates(response) {
-    // New @google/genai SDK exposes response.text as a convenience getter.
-    if (response && typeof response.text === 'string' && response.text.trim().length > 0) {
-      return {
-        text: response.text.trim(),
-        candidate: response.candidates?.[0] || null,
-        finishReason: response.candidates?.[0]?.finishReason || null
-      };
-    }
+  /**
+   * Streaming completion for the interview session controller: takes
+   * pre-composed OpenAI-style messages (system/user/assistant) and a
+   * coordinator-owned AbortSignal, converts them to Gemini's contents/
+   * systemInstruction shape, and routes through the shared, deadline/retry-
+   * hardened SSE pipeline. Returns {text, finishReason, timing}; throws a
+   * providerError with a `code` (e.g. EMPTY_RESPONSE, CANCELLED, AUTH_ERROR).
+   */
+  generateAnswer({ messages, signal, onDelta } = {}) {
+    if (!this.isInitialized) throw new Error('Gemini service not initialized. Check GEMINI_API_KEY configuration.');
+    const apiKey = config.getApiKey('GEMINI');
+    const geminiRequest = this.applyGenerationDefaults(this._messagesToGeminiRequest(messages));
+    const body = JSON.stringify(geminiRequest);
+    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${this.model}:streamGenerateContent?alt=sse`);
+    const requestOptions = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent': this.getUserAgent()
+      }
+    };
+    return streamCompletion({
+      transport: https,
+      requestOptions,
+      body,
+      parseEvent: geminiEvent,
+      signal,
+      onDelta
+    });
+  }
 
+  _messagesToGeminiRequest(messages = []) {
+    const systemMessage = messages.find(message => message.role === 'system');
+    return {
+      contents: messages
+        .filter(message => message.role !== 'system')
+        .map(message => ({
+          role: message.role === 'assistant' || message.role === 'model' ? 'model' : 'user',
+          parts: this._contentToGeminiParts(message.content)
+        })),
+      ...(systemMessage ? { systemInstruction: { parts: this._contentToGeminiParts(systemMessage.content) } } : {})
+    };
+  }
+
+  _contentToGeminiParts(content) {
+    const parts = Array.isArray(content) ? content : [{ type: 'text', text: content }];
+    return parts.map(part => {
+      if (part && part.inlineData) return { inlineData: part.inlineData };
+      if (part && (part.type === 'text' || (!part.type && typeof part.text === 'string'))) {
+        return { text: part.text };
+      }
+      if (part && part.type === 'image_url' && typeof part.image_url?.url === 'string') {
+        const match = part.image_url.url.match(/^data:([^;,]+);base64,(.+)$/s);
+        if (match) return { inlineData: { mimeType: match[1], data: match[2] } };
+      }
+      throw new Error('Unsupported Gemini message content.');
+    });
+  }
+
+  _messagesFromGeminiRequest(request) {
+    const messages = [];
+    if (request.systemInstruction?.parts?.length) {
+      messages.push({ role: 'system', content: this._geminiPartsToContent(request.systemInstruction.parts) });
+    }
+    for (const content of request.contents || []) {
+      messages.push({
+        role: content.role === 'model' ? 'assistant' : 'user',
+        content: this._geminiPartsToContent(content.parts || [])
+      });
+    }
+    return messages;
+  }
+
+  _geminiPartsToContent(parts) {
+    const content = parts.map(part => part.inlineData
+      ? { type: 'image_url', image_url: { url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}` } }
+      : { type: 'text', text: part.text || '' });
+    return content.every(part => part.type === 'text')
+      ? content.map(part => part.text).join('')
+      : content;
+  }
+
+  _visibleText(text) {
+    const filter = new VisibleAnswerFilter();
+    return filter.push(text) + filter.finish();
+  }
+
+  extractTextFromCandidates(response) {
     const candidates = Array.isArray(response?.candidates)
       ? response.candidates
       : Array.isArray(response)
@@ -80,12 +169,15 @@ class LLMService {
         : [];
 
     if (!candidates.length) {
+      if (response && typeof response.text === 'string' && response.text.trim().length > 0) {
+        return { text: this._visibleText(response.text.trim()), candidate: null, finishReason: null };
+      }
       throw new Error('No candidates in Gemini response');
     }
 
     const candidateWithText = candidates.find(candidate => {
       const parts = candidate?.content?.parts;
-      return Array.isArray(parts) && parts.some(part => typeof part.text === 'string' && part.text.trim().length > 0);
+      return Array.isArray(parts) && parts.some(part => part.thought !== true && typeof part.text === 'string' && part.text.trim().length > 0);
     });
 
     if (!candidateWithText) {
@@ -94,14 +186,14 @@ class LLMService {
     }
 
     const textParts = candidateWithText.content.parts
-      .filter(part => typeof part.text === 'string' && part.text.trim().length > 0)
+      .filter(part => part.thought !== true && typeof part.text === 'string' && part.text.trim().length > 0)
       .map(part => part.text.trim());
 
     if (!textParts.length) {
       throw new Error(`Candidate parts missing text after filtering: ${JSON.stringify(candidateWithText)}`);
     }
 
-    const text = textParts.join('\n');
+    const text = this._visibleText(textParts.join('\n'));
 
     return {
       text,
@@ -186,6 +278,7 @@ class LLMService {
       }
 
       // Enforce language in code fences if provided
+      responseText = this._visibleText(responseText);
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(responseText, programmingLanguage)
         : responseText;
@@ -258,11 +351,9 @@ class LLMService {
         geminiRequest.systemInstruction = { parts: [{ text: skillPrompt }] };
       }
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const messages = this._messagesFromGeminiRequest(geminiRequest);
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -350,6 +441,7 @@ class LLMService {
       }
       
       // Enforce language in code fences if programmingLanguage specified
+      response = this._visibleText(response);
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(response, programmingLanguage)
         : response;
@@ -400,11 +492,9 @@ class LLMService {
     try {
       const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const messages = this._messagesFromGeminiRequest(geminiRequest);
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -485,6 +575,7 @@ class LLMService {
       }
       
       // Enforce language in code fences if programmingLanguage specified
+      response = this._visibleText(response);
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(response, programmingLanguage)
         : response;
@@ -799,21 +890,23 @@ Always respond to the point, do not repeat the question or unnecessary informati
 
 ## Response Rules:
 
-### If the transcription is casual conversation, greetings, or NOT related to ${activeSkill}:
-- Respond with: "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
-- Or similar brief acknowledgments like: "I'm here, what's your ${activeSkill} question?"
-
 ### If the transcription IS relevant to ${activeSkill} or is a follow-up question:
 - Provide a comprehensive, detailed response
 - Use bullet points, examples, and explanations
 - Focus on actionable insights and complete answers
 - Do not truncate or shorten your response
 
-### Examples of casual/irrelevant messages:
-- "Hello", "Hi there", "How are you?"
-- "What's the weather like?"
-- "I'm just testing this"
-- Random conversations not related to ${activeSkill}
+### If the transcription is a general interview question NOT related to ${activeSkill}
+(e.g. "tell me about yourself," "why this role," strengths/weaknesses, a factual
+or general-knowledge question, small talk that expects an actual answer):
+- Answer it directly and concisely — don't dodge it just because it's off-skill
+- Keep it brief (a few sentences), not a ${activeSkill}-style deep dive
+- Do not mention that it's unrelated to ${activeSkill}
+
+### If the transcription is pure noise, silence artifacts, or has no real question
+(e.g. background chatter, "um," a stray word, near-empty transcript):
+- Respond with: "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
+- Or similar brief acknowledgments like: "I'm here, what's your ${activeSkill} question?"
 
 ### Examples of relevant messages:
 - Actual questions about ${activeSkill} concepts
@@ -821,15 +914,24 @@ Always respond to the point, do not repeat the question or unnecessary informati
 - Requests for clarification on ${activeSkill} topics
 - Problem-solving requests related to ${activeSkill}
 
+### Examples of general-but-answerable questions:
+- "Tell me about yourself", "Why do you want this role?", "What are your strengths?"
+- Factual or general-knowledge questions with a clear answer
+- Any question the candidate would be expected to actually respond to in an interview
+
+### Examples of noise (brush off):
+- Silence, background chatter, filler sounds with no question
+- Fragments too short/garbled to mean anything
+
 ## Response Format:
-- Keep responses detailed
-- Use bullet points for structured answers
+- Keep responses detailed for ${activeSkill} questions
+- Keep responses brief for general/off-skill questions
+- Use bullet points for structured answers where helpful
 - Be encouraging and helpful
-- Stay focused on ${activeSkill}
 
 If the user's input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.
 
-Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
+Remember: Be intelligent about filtering - only brush off true noise/silence. Always answer real questions, whether they're about ${activeSkill} or general interview questions.`;
 
     return prompt;
   }
@@ -989,11 +1091,9 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     try {
       const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const messages = this._messagesFromGeminiRequest(geminiRequest);
+      const result = await this.generateAnswer({ messages, onDelta });
+      const fullText = result.text;
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -1027,165 +1127,6 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       // single final response.
       return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage);
     }
-  }
-
-  /** Safely pull the text delta out of a streamed Gemini chunk. */
-  _extractChunkText(chunk) {
-    try {
-      const t = chunk && chunk.text;
-      if (typeof t === 'string') {
-        return t;
-      }
-    } catch (_) {
-      // `.text` getter can throw on non-text parts; fall through to manual read.
-    }
-    try {
-      const parts = (chunk && chunk.candidates && chunk.candidates[0] &&
-        chunk.candidates[0].content && chunk.candidates[0].content.parts) || [];
-      return parts.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('');
-    } catch (_) {
-      return '';
-    }
-  }
-
-  /**
-   * Run a streaming Gemini request with the same model-fallback + retry policy
-   * as executeRequest. Accumulates and returns the full text; invokes onDelta
-   * for each chunk.
-   */
-  async executeStreamingRequest(geminiRequest, onDelta) {
-    const maxRetries = config.get('llm.gemini.maxRetries');
-    const apiKey = config.getApiKey('GEMINI');
-    const primaryModel = this.model;
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
-
-    let lastError = null;
-
-    for (const modelName of modelsToTry) {
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          const fullText = await this._streamRequestForModel(geminiRequest, modelName, apiKey, onDelta);
-
-          if (!fullText) {
-            throw new Error('Empty streamed response from Gemini API');
-          }
-
-          logger.debug('Gemini streaming request successful', {
-            attempt,
-            model: modelName,
-            responseLength: fullText.length
-          });
-
-          return fullText;
-        } catch (error) {
-          const errorInfo = this.analyzeError(error);
-          lastError = error;
-
-          logger.warn(`Gemini streaming attempt ${attempt} failed for model ${modelName}`, {
-            error: error.message,
-            errorType: errorInfo.type,
-            remainingAttempts: maxRetries - attempt,
-            model: modelName
-          });
-
-          const isModelUnavailable = errorInfo.type === 'RATE_LIMIT_ERROR' ||
-            error.message.includes('503') ||
-            error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand');
-
-          if (isModelUnavailable && modelName !== modelsToTry[modelsToTry.length - 1]) {
-            break; // try next fallback model
-          }
-
-          if (attempt === maxRetries) {
-            break;
-          }
-
-          const baseDelay = errorInfo.isNetworkError ? 2500 : 1500;
-          const delay = baseDelay * attempt + Math.random() * 1000;
-          await this.delay(delay);
-        }
-      }
-    }
-
-    throw lastError || new Error('Gemini streaming request failed');
-  }
-
-  _streamRequestForModel(geminiRequest, modelName, apiKey, onDelta) {
-    const https = require('https');
-    const timeout = config.get('llm.gemini.timeout');
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
-    const postData = JSON.stringify(geminiRequest);
-    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
-
-    const options = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-        'Content-Length': Buffer.byteLength(postData),
-        'User-Agent': this.getUserAgent()
-      },
-      timeout,
-      agent
-    };
-
-    return new Promise((resolve, reject) => {
-      const req = https.request(url, options, (res) => {
-        if (res.statusCode !== 200) {
-          let errBody = '';
-          res.on('data', (c) => { errBody += c; });
-          res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${errBody}`)));
-          return;
-        }
-
-        let fullText = '';
-        let buffer = '';
-
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => {
-          buffer += chunk;
-          let idx;
-          while ((idx = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, idx).trim();
-            buffer = buffer.slice(idx + 1);
-            if (!line.startsWith('data:')) {
-              continue;
-            }
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') {
-              continue;
-            }
-            try {
-              const json = JSON.parse(payload);
-              const piece = this._extractChunkText(json);
-              if (piece) {
-                fullText += piece;
-                if (typeof onDelta === 'function') {
-                  onDelta(piece);
-                }
-              }
-            } catch (_) {
-              // Partial JSON across chunk boundaries is rare with line framing;
-              // skip anything that doesn't parse cleanly.
-            }
-          }
-        });
-
-        res.on('end', () => resolve(fullText.trim()));
-        res.on('error', (error) => reject(new Error(`Streaming response error: ${error.message}`)));
-      });
-
-      req.on('error', (error) => reject(new Error(`Streaming request failed: ${error.message}`)));
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Streaming request timeout'));
-      });
-
-      req.write(postData);
-      req.end();
-    });
   }
 
   async performPreflightCheck() {
@@ -1330,6 +1271,8 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       'dsa': 'This appears to be a data structures and algorithms problem. Consider breaking it down into smaller components and identifying the appropriate algorithm or data structure to use.',
       'system-design': 'For this system design question, consider scalability, reliability, and the trade-offs between different architectural approaches.',
       'programming': 'This looks like a programming challenge. Focus on understanding the requirements, edge cases, and optimal time/space complexity.',
+      'code-explanation': 'This looks like code that needs explaining. Consider breaking down the syntax, logic, and overall functionality.',
+      'aptitude': 'This appears to be an aptitude or reasoning question. Focus on logical steps to arrive at the solution.',
       'default': 'I can help analyze this content. Please ensure your Gemini API key is properly configured for detailed analysis.'
     };
 
@@ -1359,7 +1302,9 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       'presentation': ['slide', 'audience', 'public speaking', 'presentation', 'nervous'],
       'data-science': ['data', 'model', 'machine learning', 'statistics', 'analytics', 'python', 'pandas'],
       'devops': ['deployment', 'ci/cd', 'docker', 'kubernetes', 'infrastructure', 'monitoring'],
-      'negotiation': ['negotiate', 'compromise', 'agreement', 'terms', 'conflict resolution']
+      'negotiation': ['negotiate', 'compromise', 'agreement', 'terms', 'conflict resolution'],
+      'code-explanation': ['explain', 'understand', 'how does this work', 'meaning', 'logic', 'trace'],
+      'aptitude': ['math', 'puzzle', 'logic', 'reasoning', 'sequence', 'calculate', 'probability']
     };
 
     const textLower = text.toLowerCase();
@@ -1371,12 +1316,14 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const seemsLikeQuestion = questionIndicators.some(indicator => textLower.includes(indicator));
 
     let response;
-    if (hasRelevantKeywords || seemsLikeQuestion) {
+    if (hasRelevantKeywords) {
       response = `I'm having trouble processing that right now, but it sounds like a ${activeSkill} question. Could you rephrase or ask more specifically about what you need help with?`;
+    } else if (seemsLikeQuestion) {
+      response = `I'm having trouble processing that right now — could you repeat the question?`;
     } else {
       response = `Yeah, I'm listening. Ask your question relevant to ${activeSkill}.`;
     }
-    
+
     return {
       response,
       metadata: {

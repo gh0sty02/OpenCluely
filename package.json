@@ -4,8 +4,10 @@
   "description": "AI Problem Solving Assistant",
   "main": "main.js",
   "scripts": {
-    "start": "env -u ELECTRON_RUN_AS_NODE electron .",
-    "dev": "env -u ELECTRON_RUN_AS_NODE electron . --no-sandbox --disable-gpu",
+    "start": "node scripts/start-electron.js",
+    "dev": "node scripts/start-electron.js --disable-gpu",
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/check.js",
     "test-speech": "node scripts/test-speech.js",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
@@ -14,7 +16,7 @@
     "build:all": "electron-builder --mac --win --linux",
     "dist": "npm run build",
     "pack": "electron-builder --dir",
-    "clean": "rm -rf dist/",
+    "clean": "node scripts/clean.js",
     "rebuild": "npm run clean && npm run build",
     "release": "npm run clean && npm run build:all",
     "postinstall": "electron-builder install-app-deps"

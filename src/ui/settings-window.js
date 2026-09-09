@@ -16,11 +16,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const whisperCaptureModeSelect = document.getElementById('whisperCaptureMode');
     const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
+    const mistralKeyInput = document.getElementById('mistralKey');
     const geminiKeyInput = document.getElementById('geminiKey');
     const windowGapInput = document.getElementById('windowGap');
     const codingLanguageSelect = document.getElementById('codingLanguage');
     const activeSkillSelect = document.getElementById('activeSkill');
+    const audioSourceSelect = document.getElementById('audioSource');
     const iconGrid = document.getElementById('iconGrid');
+    // OpenRouter provider elements
+    const llmProviderSelect = document.getElementById('llmProvider');
+    const openrouterKeyInput = document.getElementById('openrouterKey');
+    const openrouterModelInput = document.getElementById('openrouterModel');
+    const openrouterBaseUrlInput = document.getElementById('openrouterBaseUrl');
 
     // Check if window.api exists
     if (!window.api) {
@@ -74,6 +81,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Function to load settings into UI
     const loadSettingsIntoUI = (settings) => {
+        if (audioSourceSelect) audioSourceSelect.value = settings.audioSource || 'system';
+        document.getElementById('speechReadiness').textContent = settings.speechAvailable
+            ? 'Speech provider configured. Start listening to check capture and see your transcript.'
+            : 'Speech provider needs setup. Typed questions are still available.';
         if (settings.speechProvider && speechProviderSelect) speechProviderSelect.value = settings.speechProvider;
         // Always set the input value, even if empty, so the user sees what's
         // currently configured (including env-derived defaults). Previously
@@ -87,15 +98,21 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCaptureModeSelect) whisperCaptureModeSelect.value = settings.whisperCaptureMode || 'vad';
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
+        if (mistralKeyInput) mistralKeyInput.value = settings.mistralKey || '';
         if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
+        // OpenRouter / provider fields
+        if (llmProviderSelect) llmProviderSelect.value = settings.llmProvider || 'gemini';
+        if (openrouterKeyInput) openrouterKeyInput.value = settings.openrouterKey || '';
+        if (openrouterModelInput) openrouterModelInput.value = settings.openrouterModel || '';
+        if (openrouterBaseUrlInput) openrouterBaseUrlInput.value = settings.openrouterBaseUrl || '';
 
         // Set C++ as default if no coding language is specified
         if (codingLanguageSelect) {
             codingLanguageSelect.value = settings.codingLanguage || 'cpp';
         }
 
-        if (settings.activeSkill && activeSkillSelect) activeSkillSelect.value = settings.activeSkill;
+        if (activeSkillSelect) activeSkillSelect.value = settings.activeSkill || 'interview';
 
         // Handle icon selection
         const selectedIcon = settings.selectedIcon || settings.appIcon;
@@ -111,6 +128,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         updateSpeechFieldStates();
+        updateLLMProviderFieldStates();
     };
 
     // Load settings when window opens
@@ -134,7 +152,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Save settings helper function
-    const saveSettings = () => {
+    const saveSettings = async () => {
         const settings = {};
         if (speechProviderSelect) settings.speechProvider = speechProviderSelect.value;
         if (azureKeyInput) settings.azureKey = azureKeyInput.value;
@@ -146,13 +164,49 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperCaptureModeSelect) settings.whisperCaptureMode = whisperCaptureModeSelect.value;
         if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
+        if (mistralKeyInput) settings.mistralKey = mistralKeyInput.value;
         if (geminiKeyInput) settings.geminiKey = geminiKeyInput.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
         if (codingLanguageSelect) settings.codingLanguage = codingLanguageSelect.value;
         if (activeSkillSelect) settings.activeSkill = activeSkillSelect.value;
+        if (audioSourceSelect) settings.audioSource = audioSourceSelect.value;
+        // OpenRouter / provider fields
+        if (llmProviderSelect) settings.llmProvider = llmProviderSelect.value;
+        if (openrouterKeyInput) settings.openrouterKey = openrouterKeyInput.value;
+        if (openrouterModelInput) settings.openrouterModel = openrouterModelInput.value;
+        if (openrouterBaseUrlInput) settings.openrouterBaseUrl = openrouterBaseUrlInput.value;
         
-        window.api.send('save-settings', settings);
+        try {
+            const result = await window.electronAPI.saveSettings(settings);
+            if (result?.error) throw new Error(result.error);
+            connectionStatus.textContent = 'Settings saved. Test the connection to verify the model.';
+            return true;
+        } catch (error) {
+            connectionStatus.textContent = error.message || 'Settings could not be saved.';
+            requestCurrentSettings();
+            return false;
+        }
     };
+
+    const connectionStatus = document.createElement('p');
+    connectionStatus.className = 'settings-note';
+    connectionStatus.setAttribute('role', 'status');
+    connectionStatus.textContent = 'Test the selected endpoint and model with a short request.';
+    const testConnection = document.createElement('button');
+    testConnection.className = 'interview-button primary';
+    testConnection.textContent = 'Test AI connection';
+    document.getElementById('openrouterFields').parentElement.append(testConnection, connectionStatus);
+    testConnection.addEventListener('click', async () => {
+        testConnection.disabled = true;
+        try {
+            if (!await saveSettings()) return;
+            connectionStatus.textContent = 'Sending a short request to the selected model...';
+            const result = await window.electronAPI.testLlmConnection();
+            connectionStatus.textContent = result.success ? 'Connection verified. The selected model returned an answer.' : result.error || result.message || 'Connection failed. Check the endpoint, model and API key.';
+        } catch (error) {
+            connectionStatus.textContent = error.message || 'Connection test failed.';
+        } finally { testConnection.disabled = false; }
+    });
 
     const updateSpeechFieldStates = () => {
         const provider = speechProviderSelect ? speechProviderSelect.value : 'azure';
@@ -162,6 +216,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // for the selected provider are visible.
         const azureGroup = document.getElementById('azureFields');
         const whisperGroup = document.getElementById('whisperFields');
+        const mistralGroup = document.getElementById('mistralFields');
         const azureNote = document.getElementById('azureFieldsNote');
 
         if (azureGroup) {
@@ -169,6 +224,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (whisperGroup) {
             whisperGroup.style.display = provider === 'whisper' ? '' : 'none';
+        }
+        if (mistralGroup) {
+            mistralGroup.style.display = provider === 'mistral' ? '' : 'none';
         }
         if (azureNote) {
             azureNote.style.display = provider === 'azure' ? '' : 'none';
@@ -182,10 +240,26 @@ document.addEventListener('DOMContentLoaded', () => {
             whisperCaptureModeSelect, whisperResponseTargetSelect, whisperSegmentMsInput].forEach(input => {
             if (input) input.disabled = provider !== 'whisper';
         });
+        [mistralKeyInput].forEach(input => {
+            if (input) input.disabled = provider !== 'mistral';
+        });
+    };
+
+    const updateLLMProviderFieldStates = () => {
+        const selectedProvider = llmProviderSelect ? llmProviderSelect.value : 'gemini';
+        const geminiGroup = document.getElementById('geminiFields');
+        const openrouterGroup = document.getElementById('openrouterFields');
+        if (geminiGroup) geminiGroup.style.display = selectedProvider === 'gemini' ? '' : 'none';
+        if (openrouterGroup) openrouterGroup.style.display = selectedProvider === 'openrouter' ? '' : 'none';
+        if (geminiKeyInput) geminiKeyInput.disabled = selectedProvider !== 'gemini';
+        if (openrouterKeyInput) openrouterKeyInput.disabled = selectedProvider !== 'openrouter';
+        if (openrouterModelInput) openrouterModelInput.disabled = selectedProvider !== 'openrouter';
+        if (openrouterBaseUrlInput) openrouterBaseUrlInput.disabled = selectedProvider !== 'openrouter';
     };
 
     // Add event listeners for all inputs
     const inputs = [
+        audioSourceSelect,
         azureKeyInput,
         azureRegionInput,
         whisperCommandInput,
@@ -195,8 +269,12 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperCaptureModeSelect,
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
+        mistralKeyInput,
         geminiKeyInput,
-        windowGapInput
+        windowGapInput,
+        openrouterKeyInput,
+        openrouterModelInput,
+        openrouterBaseUrlInput
     ];
 
     inputs.forEach(input => {
@@ -209,6 +287,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (speechProviderSelect) {
         speechProviderSelect.addEventListener('change', () => {
             updateSpeechFieldStates();
+            saveSettings();
+        });
+    }
+
+    if (llmProviderSelect) {
+        llmProviderSelect.addEventListener('change', () => {
+            updateLLMProviderFieldStates();
             saveSettings();
         });
     }
@@ -237,6 +322,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     updateSpeechFieldStates();
+    updateLLMProviderFieldStates();
 
     // Initialize icon grid with correct paths
     const initializeIconGrid = () => {

@@ -25,6 +25,8 @@ class WindowManager {
     this.isInitialized = false;
     this.isInitializing = false;
     this.isRecording = false;
+    this.assessmentMode = false;
+    this.assessmentWatchdog = null;
     
     // Add debouncing to prevent excessive operations
     this.lastEnforceTime = 0;
@@ -513,11 +515,23 @@ class WindowManager {
           }
         });
 
-        // When resized (by user or programmatically), keep bound windows aligned at top
+        // When resized (by user or programmatically), keep bound windows aligned
         window.on('resize', () => {
           if (this.bindWindows) {
             this.positionBoundWindows();
           }
+        });
+
+        // The command bar is `-webkit-app-region: drag`, so the user repositions
+        // this window via native OS dragging — never through moveWindow()/IPC.
+        // Without tracking that here, positionBoundWindows() only knows about
+        // moves made through moveBoundWindows() and falls back to recentering,
+        // which undoes a drag the moment content changes size (e.g. every
+        // streamed answer chunk resizing the interview panel).
+        window.on('move', () => {
+          if (!this.bindWindows) return;
+          const [x, y] = window.getPosition();
+          this.boundWindowsPosition = { x, y };
         });
       } catch { /* ignore */ }
     }
@@ -591,21 +605,33 @@ class WindowManager {
         window.setAlwaysOnTop(true);
       }
     } else if (process.platform === 'win32') {
-      // Windows: Multiple enforcement attempts
-      window.setAlwaysOnTop(true);
-      
+      // Windows: calling setAlwaysOnTop(true) on a window that's ALREADY
+      // topmost is frequently a no-op — Windows won't re-order two topmost
+      // windows relative to each other without an actual state change. That's
+      // exactly what breaks this the moment another app (a call in fullscreen,
+      // a presentation, a game) also claims topmost on entering fullscreen:
+      // it can end up above this window and nothing here would ever ask
+      // Windows to reconsider. Toggling off then back on forces a real
+      // z-order re-insertion at the top; 'screen-saver' requests the highest
+      // level Electron exposes (Windows treats the level as a hint but it
+      // doesn't hurt to pass it, same as the other platforms above).
+      window.setAlwaysOnTop(false);
+      window.setAlwaysOnTop(true, 'screen-saver');
+
       setTimeout(() => {
         if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
+          window.setAlwaysOnTop(false);
+          window.setAlwaysOnTop(true, 'screen-saver');
         }
       }, 100);
-      
+
       setTimeout(() => {
         if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
+          window.setAlwaysOnTop(false);
+          window.setAlwaysOnTop(true, 'screen-saver');
         }
       }, 500);
-      
+
     } else {
       // Linux and other platforms
       window.setAlwaysOnTop(true);
@@ -646,6 +672,12 @@ class WindowManager {
                 window.setAlwaysOnTop(true, 'screen-saver', 1);
               }
             }, 50);
+          } else if (process.platform === 'win32') {
+            // See the matching comment in applyStealthMeasures — the toggle
+            // is what actually re-asserts top z-order on Windows, a flat
+            // setAlwaysOnTop(true) on an already-topmost window often does nothing.
+            window.setAlwaysOnTop(false);
+            window.setAlwaysOnTop(true, 'screen-saver');
           } else {
             window.setAlwaysOnTop(true);
           }
@@ -737,33 +769,36 @@ class WindowManager {
     
     const [mainWidth, mainHeight] = mainWindow.getSize();
     const [llmWidth, llmHeight] = llmWindow.getSize();
-    
-    // Always position at the top of the screen with small margin
     const topMargin = 20;
-    const startY = displayY + topMargin;
-    
-    // Use the wider window for horizontal centering
-    const maxWidth = Math.max(mainWidth, llmWidth);
-    
-    // Center horizontally on the display
-    const xPosition = displayX + Math.round((screenWidth - maxWidth) / 2);
-    
+
+    // Re-flowing this layout (called on every resize — including the interview
+    // panel growing as an answer streams in) must not fight wherever the user
+    // last put the window. Anchor to the tracked/current position and only
+    // fall back to the centered-at-top default the very first time, before
+    // any position has ever been recorded (sentinel {x:0,y:0}).
+    const hasKnownPosition = this.boundWindowsPosition && (this.boundWindowsPosition.x !== 0 || this.boundWindowsPosition.y !== 0);
+    let anchorX, anchorY;
+    if (hasKnownPosition) {
+      ({ x: anchorX, y: anchorY } = this.boundWindowsPosition);
+    } else {
+      const maxWidth = Math.max(mainWidth, llmWidth);
+      anchorX = displayX + Math.round((screenWidth - maxWidth) / 2);
+      anchorY = displayY + topMargin;
+    }
+
     // Ensure windows don't go outside screen bounds horizontally
-    const adjustedMainX = Math.max(displayX, Math.min(displayX + screenWidth - mainWidth, xPosition));
-    const adjustedLlmX = Math.max(displayX, Math.min(displayX + screenWidth - llmWidth, xPosition));
-    
-    // Position main window (top)
-    const mainX = adjustedMainX;
-    const mainY = startY;
+    const mainX = Math.max(displayX, Math.min(displayX + screenWidth - mainWidth, anchorX));
+    const mainY = Math.max(displayY, Math.min(displayY + screenHeight - mainHeight, anchorY));
     mainWindow.setPosition(mainX, mainY);
-    
-    // Position LLM response window below with gap
-    const llmX = adjustedLlmX;
-    const llmY = startY + mainHeight + this.windowGap;
+
+    // Position LLM response window below with gap, sharing the main window's
+    // left edge so the pair stays visually aligned wherever it was moved.
+    const llmX = Math.max(displayX, Math.min(displayX + screenWidth - llmWidth, mainX));
+    const llmY = mainY + mainHeight + this.windowGap;
     llmWindow.setPosition(llmX, llmY);
-    
+
     // Update stored position (use main window position as reference)
-    this.boundWindowsPosition = { x: adjustedMainX, y: startY };
+    this.boundWindowsPosition = { x: mainX, y: mainY };
     
     logger.debug('Positioned bound windows at top (column layout)', {
       mainPosition: `${mainX},${mainY}`,
@@ -930,6 +965,18 @@ class WindowManager {
       return;
     }
 
+    // On Windows, this probe drives Chromium's DXGI Desktop Duplication API.
+    // Overlay software that hooks the same DXGI APIs (NVIDIA GeForce
+    // Experience, etc.) can make the underlying capture call block at the GPU
+    // process level — which no JS-side timeout can preempt — causing the
+    // whole app to go "Not Responding". screenCaptureStatus is only exposed
+    // as a debug/status field (see getStatus()), not used to drive any
+    // feature, so it isn't worth polling every 5s at that risk.
+    if (process.platform === 'win32') {
+      logger.info('Skipping screen capture availability watcher on Windows to avoid DXGI/overlay contention hangs');
+      return;
+    }
+
     if (this.screenCaptureAvailabilityWatcher) {
       clearInterval(this.screenCaptureAvailabilityWatcher);
     }
@@ -954,10 +1001,21 @@ class WindowManager {
     const checkedAt = new Date().toISOString();
 
     try {
-      await desktopCapturer.getSources({
-        types: ['screen', 'window'],
-        thumbnailSize: { width: 1, height: 1 }
-      });
+      // desktopCapturer.getSources() drives Chromium's DXGI Desktop Duplication
+      // on Windows. Overlay software (NVIDIA GeForce Experience, etc.) hooking
+      // the same DXGI APIs can make this call block indefinitely instead of
+      // failing fast — without a timeout that hangs the main process (and the
+      // whole app becomes "Not Responding"). Race it against a hard deadline.
+      await Promise.race([
+        desktopCapturer.getSources({
+          types: ['screen', 'window'],
+          thumbnailSize: { width: 1, height: 1 }
+        }),
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error('desktopCapturer.getSources timed out after 3000ms')),
+          3000
+        ))
+      ]);
 
       this.screenCaptureStatus = {
         available: true,
@@ -1543,6 +1601,11 @@ class WindowManager {
       this.screenCaptureAvailabilityWatcher = null;
     }
     
+    if (this.assessmentWatchdog) {
+      clearInterval(this.assessmentWatchdog);
+      this.assessmentWatchdog = null;
+    }
+    
     logger.info('All windows destroyed');
   }
 
@@ -1818,7 +1881,68 @@ class WindowManager {
       skill,
       windowCount: this.windows.size 
     });
+  }
+
+  toggleAssessmentMode() {
+    this.assessmentMode = !this.assessmentMode;
+    
+    if (this.assessmentMode) {
+      logger.info('Assessment Mode enabled - activating watchdog');
+      this.startAssessmentWatchdog();
+      this.broadcastToAllWindows('assessment-mode-changed', { enabled: true });
+    } else {
+      logger.info('Assessment Mode disabled - deactivating watchdog');
+      this.stopAssessmentWatchdog();
+      this.broadcastToAllWindows('assessment-mode-changed', { enabled: false });
     }
+    
+    return this.assessmentMode;
+  }
+
+  startAssessmentWatchdog() {
+    if (this.assessmentWatchdog) {
+      clearInterval(this.assessmentWatchdog);
+    }
+    
+    this.assessmentWatchdog = setInterval(() => {
+      if (this.isVisible && !this.isScreenBeingShared) {
+        // Essential windows that MUST be visible when app is visible
+        const essentialWindows = ['main', 'chat'];
+        
+        this.windows.forEach((window, type) => {
+          if (!window.isDestroyed()) {
+            
+            // If it's an essential window, ensure it is completely visible
+            if (essentialWindows.includes(type) && !window.isVisible()) {
+                window.showInactive();
+            }
+            
+            if (window.isMinimized()) {
+              window.restore();
+            }
+            
+            // Re-assert always-on-top for any visible window
+            if (window.isVisible()) {
+              try {
+                if (process.platform === 'darwin') {
+                  window.setAlwaysOnTop(true, 'screen-saver', 2);
+                } else {
+                  window.setAlwaysOnTop(true);
+                }
+              } catch (e) {}
+            }
+          }
+        });
+      }
+    }, 1000);
+  }
+
+  stopAssessmentWatchdog() {
+    if (this.assessmentWatchdog) {
+      clearInterval(this.assessmentWatchdog);
+      this.assessmentWatchdog = null;
+    }
+  }
 }
 
 module.exports = new WindowManager();

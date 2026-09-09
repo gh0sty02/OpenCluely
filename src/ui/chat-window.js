@@ -306,7 +306,9 @@ class ChatWindowUI {
                     'programming': '💻',
                     'devops': '🚀',
                     'system-design': '🏗️',
-                    'negotiation': '🤝'
+                    'negotiation': '🤝',
+                    'code-explanation': '📝',
+                    'aptitude': '🧩'
                 };
                 
                 const icon = icons[skillName] || '🎯';
@@ -495,6 +497,7 @@ class ChatWindowUI {
     }
 
     formatMarkdown(text) {
+        if (window.InterviewUI) return window.InterviewUI.renderMarkdown(text);
         if (!text) return '';
         
         try {

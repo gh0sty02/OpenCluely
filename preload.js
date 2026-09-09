@@ -11,6 +11,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopSpeechRecognition: () => ipcRenderer.invoke('stop-speech-recognition'),
   sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
   getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
+
+  // Interview session coordinator (interview-panel.js)
+  interviewAction: (name, payload) => ipcRenderer.invoke('interview-action', name, payload),
+  getInterviewState: () => ipcRenderer.invoke('get-interview-state'),
+  onInterviewState: (callback) => ipcRenderer.on('interview-state', callback),
+  reportInterviewCaptureLevel: (level) => ipcRenderer.send('interview-capture-level', level),
+  reportInterviewCaptureState: (data) => ipcRenderer.send('interview-capture-state', data),
   
   // Window management
   showAllWindows: () => ipcRenderer.invoke('show-all-windows'),

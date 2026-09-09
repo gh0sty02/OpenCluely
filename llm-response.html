@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OpenCluely</title>
     <script src="lib/markdown.js"></script>
+    <script src="./src/ui/interview-state.js"></script>
     <script src="lib/mathrender.js"></script>
     <style>
         .text-white { color: white; }
@@ -417,11 +418,12 @@
         }
     </style>
 </head>
-<body class="text-white">
+<body class="text-white interview-floating">
+    <link rel="stylesheet" href="./src/styles/common.css">
     <div class="main-container has-header">
         <!-- Draggable Header -->
         <div class="window-header">
-            <div class="window-title">AI Response</div>
+            <div class="window-title">Interview answer</div>
             <div class="window-controls">
                 <button id="close-window-btn" class="window-btn window-btn-close" title="Close">×</button>
             </div>
@@ -471,7 +473,7 @@
         // Global variables
         let currentLayout = 'split';
         let hasCode = false;
-        let currentSkill = 'dsa';
+        let currentSkill = 'interview';
         let isInteractive = false;
         let scrollableElements = [];
         let initialized = false;
@@ -603,6 +605,7 @@
         }
 
         function renderMarkdown(text) {
+            if (window.InterviewUI) return window.InterviewUI.renderMarkdown(text);
             if (typeof marked !== 'undefined') {
                 return marked.parse ? marked.parse(text) : marked(text);
             }

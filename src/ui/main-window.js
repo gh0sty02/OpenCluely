@@ -48,6 +48,16 @@ class MainWindowUI {
             this.updateSkillIndicator();
             this.updateAllElementStates(); // Update all elements with current state
             this.resizeWindowToContent();
+
+            // interview-panel.js re-renders #interviewWorkspace independently
+            // (driven by interview-state pushes from main), so watch its size
+            // directly rather than threading a resize call through it.
+            if (typeof ResizeObserver === 'function') {
+                const workspace = document.getElementById('interviewWorkspace');
+                if (workspace) {
+                    new ResizeObserver(() => this.resizeWindowToContent()).observe(workspace);
+                }
+            }
             
             logger.info('Main window UI initialized', {
                 component: 'MainWindowUI',
@@ -242,7 +252,13 @@ class MainWindowUI {
         // Wait for DOM to fully render
         setTimeout(() => {
             const commandTab = document.querySelector('.command-tab');
+            const workspace = document.getElementById('interviewWorkspace');
             if (commandTab && window.electronAPI && window.electronAPI.resizeWindow) {
+                // Clear any cap from a previous (longer) answer before
+                // measuring, so a since-trimmed answer is re-measured at its
+                // true natural size rather than the old capped one.
+                if (workspace) workspace.style.maxHeight = '';
+
                 const rect = commandTab.getBoundingClientRect();
                 const width = Math.ceil(rect.width);
                 let height = Math.ceil(rect.height);
@@ -253,13 +269,42 @@ class MainWindowUI {
                     // popover is positioned below the bar (top:36px), add that plus its height and a small margin
                     height = Math.max(height, Math.ceil(36 + popRect.height + 8));
                 }
-                
+
+                // The interview panel (question/answer/history) and the typed-
+                // question compose form sit below the command bar and are not
+                // part of its rect. Without this the window stays locked at
+                // just the bar's height and everything below is clipped.
+                const naturalHeight = Math.max(height, Math.ceil(document.body.scrollHeight));
+
+                // Cap so a very long answer doesn't grow the window past the
+                // screen; content beyond this scrolls inside #interviewWorkspace.
+                const maxHeight = Math.round((window.screen.availHeight || 900) * 0.75);
+                height = Math.min(naturalHeight, maxHeight);
+
+                // index.html's body is `height: fit-content` (see resolveEnvPath
+                // note above) and never scrolls itself — it always renders at
+                // its full natural size regardless of the window's actual pixel
+                // height, so once content exceeds maxHeight the excess would
+                // just be clipped invisibly. Give #interviewWorkspace (which
+                // already has overflow:auto — see common.css) an explicit pixel
+                // budget so its own scrollbar engages instead.
+                if (workspace) {
+                    if (naturalHeight > maxHeight) {
+                        const otherContentHeight = naturalHeight - Math.ceil(workspace.scrollHeight);
+                        const budget = Math.max(80, maxHeight - otherContentHeight);
+                        workspace.style.maxHeight = budget + 'px';
+                    } else {
+                        workspace.style.maxHeight = '';
+                    }
+                }
+
                 logger.debug('Resizing window to content', {
                     width,
                     height,
+                    capped: naturalHeight > maxHeight,
                     component: 'MainWindowUI'
                 });
-                
+
                 window.electronAPI.resizeWindow(width, height);
             }
         }, 100);
@@ -270,8 +315,9 @@ class MainWindowUI {
         this.skillIndicator = document.getElementById('skillIndicator');
         this.settingsIndicator = document.getElementById('settingsIndicator'); // Optional
         this.micButton = document.getElementById('micButton');
-    this.infoButton = document.getElementById('infoButton');
-    this.shortcutsPopover = document.getElementById('shortcutsPopover');
+        this.infoButton = document.getElementById('infoButton');
+        this.quitButton = document.getElementById('quitButton');
+        this.shortcutsPopover = document.getElementById('shortcutsPopover');
 
         // NEW: Screenshot button is the first .command-item without id
         const commandItems = document.querySelectorAll('.command-item');
@@ -375,11 +421,21 @@ class MainWindowUI {
 
         // Info button / shortcuts popover
         if (this.infoButton && this.shortcutsPopover) {
-            this.infoButton.addEventListener('click', (e) => {
+                this.infoButton.addEventListener('click', (e) => {
                 if (!this.isInteractive) return;
                 e.stopPropagation();
                 this.toggleShortcutsPopover();
             });
+
+            // Quit button handler
+            if (this.quitButton) {
+                this.quitButton.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (window.electronAPI && window.electronAPI.quit) {
+                        window.electronAPI.quit();
+                    }
+                });
+            }
 
             // Hover to show
             this.infoButton.addEventListener('mouseenter', () => {
@@ -527,7 +583,9 @@ class MainWindowUI {
             'programming': 'Programming',
             'devops': 'DevOps',
             'system-design': 'System Design',
-            'negotiation': 'Negotiation'
+            'negotiation': 'Negotiation',
+            'code-explanation': 'Code Explanation',
+            'aptitude': 'Aptitude'
         };
         
         const displaySkill = skillNames[skill] || skill.toUpperCase();
@@ -766,7 +824,9 @@ class MainWindowUI {
             'programming': 'Programming',
             'devops': 'DevOps',
             'system-design': 'System Design',
-            'negotiation': 'Negotiation'
+            'negotiation': 'Negotiation',
+            'code-explanation': 'Code Explanation',
+            'aptitude': 'Aptitude'
         };
         
         logger.info('Updating skill indicator', {
@@ -879,7 +939,9 @@ class MainWindowUI {
             'programming': 'Programming',
             'devops': 'DevOps',
             'system-design': 'System Design',
-            'negotiation': 'Negotiation'
+            'negotiation': 'Negotiation',
+            'code-explanation': 'Code Explanation',
+            'aptitude': 'Aptitude'
         };
         
         const displayName = skillNames[skill] || skill.toUpperCase();

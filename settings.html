@@ -295,7 +295,7 @@
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-code"></i>
-                    Language & Skills
+                    Answer preferences
                 </div>
                 <div class="settings-section-content">
                     <div class="settings-item">
@@ -313,11 +313,17 @@
                     </div>
                     <div class="settings-item">
                         <div>
-                            <div class="settings-item-label">Active Skill</div>
-                            <div class="settings-item-description">Choose your current focus area</div>
+                            <div class="settings-item-label">Answer style</div>
+                            <div class="settings-item-description">Auto interview adapts to each question</div>
                         </div>
                         <select class="input-field" id="activeSkill">
+                            <option value="interview">Auto interview</option>
+                            <option value="general">General</option>
+                            <option value="behavioral">Behavioral</option>
                             <option value="dsa">Data Structures & Algorithms</option>
+                            <option value="system-design">System Design</option>
+                            <option value="code-explanation">Code Explanation</option>
+                            <option value="aptitude">Aptitude</option>
                         </select>
                     </div>
                 </div>
@@ -349,21 +355,30 @@
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-microphone"></i>
-                    Speech Recognition
+                    Audio setup
                 </div>
                 <div class="settings-section-content">
                     <div class="settings-item">
                         <div>
-                            <div class="settings-item-label">Speech Provider</div>
-                            <div class="settings-item-description">Choose Azure Speech or a local OpenAI Whisper CLI</div>
+                            <div class="settings-item-label">Speech provider</div>
+                            <div class="settings-item-description">Choose Azure Speech, a local OpenAI Whisper CLI, or Mistral Voxtral</div>
                         </div>
                         <select class="input-field" id="speechProvider">
                             <option value="azure">Azure Speech</option>
                             <option value="whisper">Local Whisper</option>
+                            <option value="mistral">Mistral Voxtral</option>
                         </select>
                     </div>
 
                     <!-- Azure fields (shown only when Azure is selected) -->
+                    <div class="settings-item">
+                        <div>
+                            <label class="settings-item-label" for="audioSource">Audio source</label>
+                            <div class="settings-item-description">System audio includes call audio and other desktop sounds. Microphone questions wait for Answer now.</div>
+                        </div>
+                        <select class="input-field" id="audioSource"><option value="system">System audio</option><option value="microphone">Microphone</option></select>
+                    </div>
+                    <p class="settings-note" id="speechReadiness" role="status">Checking speech provider...</p>
                     <div id="azureFields" class="settings-group">
                         <div class="settings-item">
                             <div>
@@ -453,21 +468,77 @@
                     <div id="azureFieldsNote" class="settings-note">
                         Azure credentials apply immediately and are also written back to <code>.env</code> so they persist across restarts.
                     </div>
+
+                    <!-- Mistral fields (shown only when Mistral Voxtral is selected) -->
+                    <div id="mistralFields" class="settings-group">
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Mistral API Key</div>
+                                <div class="settings-item-description">Your Mistral API key, used for Voxtral transcription</div>
+                            </div>
+                            <input type="password" class="input-field" id="mistralKey" placeholder="Enter your Mistral key">
+                        </div>
+                        <div class="settings-note">
+                            Mistral Voxtral transcribes audio via the Mistral API. This key applies immediately and is also written back to <code>.env</code> so it persists across restarts.
+                        </div>
+                    </div>
                 </div>
             </div>
             
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-robot"></i>
-                    Gemini Settings
+                    AI Provider
                 </div>
                 <div class="settings-section-content">
                     <div class="settings-item">
                         <div>
-                            <div class="settings-item-label">Google API Key</div>
-                            <div class="settings-item-description">Your Google API key for Gemini models</div>
+                            <div class="settings-item-label">LLM Provider</div>
+                            <div class="settings-item-description">End your session before changing the connection</div>
                         </div>
-                        <input type="password" class="input-field" id="geminiKey" placeholder="Enter your Google API key">
+                        <select class="input-field" id="llmProvider">
+                            <option value="gemini">Google Gemini</option>
+                            <option value="openrouter">OpenRouter / custom endpoint</option>
+                        </select>
+                    </div>
+
+                    <!-- Gemini fields (shown when gemini is selected) -->
+                    <div id="geminiFields">
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Google API Key</div>
+                                <div class="settings-item-description">Your Google API key for Gemini models</div>
+                            </div>
+                            <input type="password" class="input-field" id="geminiKey" placeholder="Enter your Google API key">
+                        </div>
+                    </div>
+
+                    <!-- OpenRouter fields (shown when openrouter is selected) -->
+                    <div id="openrouterFields">
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">API key</div>
+                                <div class="settings-item-description">Get your key at <a href="https://openrouter.ai/keys" target="_blank" style="color:rgba(255,255,255,0.7)">openrouter.ai/keys</a></div>
+                            </div>
+                            <input type="password" class="input-field" id="openrouterKey" placeholder="Enter your OpenRouter key">
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Model</div>
+                                <div class="settings-item-description">Model ID supported by your selected endpoint. Screenshots also require vision support.</div>
+                            </div>
+                            <input type="text" class="input-field" id="openrouterModel" placeholder="anthropic/claude-sonnet-4">
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Custom Endpoint (optional)</div>
+                                <div class="settings-item-description">Full chat-completions URL of an OpenAI-compatible proxy. Leave blank to use openrouter.ai directly.</div>
+                            </div>
+                            <input type="text" class="input-field" id="openrouterBaseUrl" placeholder="https://your-endpoint.example.com/api/v1/chat/completions">
+                        </div>
+                        <div class="settings-note" style="margin-top:8px;">
+                            Your selected endpoint receives questions. Audio uses the speech provider configured above.
+                        </div>
                     </div>
                 </div>
             </div>
@@ -490,6 +561,7 @@
         </div>
     </div>
 
+    <link rel="stylesheet" href="./src/styles/common.css">
     <script src="./src/ui/settings-window.js"></script>
 </body>
 </html>

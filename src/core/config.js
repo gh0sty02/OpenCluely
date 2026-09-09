@@ -39,6 +39,11 @@ class ConfigManager {
       },
 
       llm: {
+        // Active provider: 'gemini' | 'openrouter'. Reads LLM_PROVIDER env var
+        // at startup; a factory module (llm.factory.js) selects the right service.
+        // Changing this at runtime requires an app restart (Node module cache).
+        provider: process.env.LLM_PROVIDER || 'gemini',
+
         gemini: {
           model: 'gemini-3.1-flash-lite',
           fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
@@ -53,6 +58,22 @@ class ConfigManager {
             maxOutputTokens: 4096,
             thinkingConfig: { thinkingBudget: 0 }
           }
+        },
+
+        openrouter: {
+          // Vision-capable model that also handles text well.
+          // Override with OPENROUTER_MODEL env var or via the settings UI.
+          model: process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4',
+          // Full chat-completions URL of an OpenAI-compatible endpoint.
+          // Leave unset to talk to openrouter.ai directly.
+          baseUrl: (process.env.OPENROUTER_BASE_URL || '').trim(),
+          maxRetries: 3,
+          timeout: 60000,
+          fallbackEnabled: true,
+          generation: {
+            temperature: 0.7,
+            max_tokens: 3000
+          }
         }
       },
 
@@ -63,6 +84,11 @@ class ConfigManager {
           enableDictation: true,
           enableAudioLogging: false,
           outputFormat: 'detailed'
+        },
+        mistral: {
+          model: 'voxtral-mini-latest',
+          timeout: 30000,
+          language: 'auto'
         },
         whisper: {
           model: 'small',

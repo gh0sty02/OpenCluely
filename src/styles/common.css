@@ -577,3 +577,168 @@ body {
     scrollbar-width: none;
     -ms-overflow-style: none;
 }
+
+/* Shared interview workspace: quiet chrome, readable answers, explicit status. */
+:root {
+    --surface: #151c2b;
+    --surface-raised: #1d2739;
+    --surface-inset: #101725;
+    --ink: #edf1fa;
+    --ink-muted: #a8b5ca;
+    --accent: #adbdff;
+    --line: #35415a;
+    --radius-control: 7px;
+    --radius-window: 12px;
+    --space: 8px;
+    color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+:focus-visible { outline: 2px solid var(--accent) !important; outline-offset: 3px; }
+button, select, input, textarea, summary, a { -webkit-app-region: no-drag; }
+button, input, select, textarea { font-family: inherit; }
+button:disabled { cursor: default; opacity: .45; }
+[hidden] { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+body.interview-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-window);
+    background: var(--surface) !important;
+    color: var(--ink);
+    font-family: 'Segoe UI', sans-serif;
+}
+.interview-shell .command-tab {
+    width: 100%;
+    min-height: 46px;
+    height: auto;
+    flex-shrink: 0;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    padding: 8px 16px;
+    margin: 0;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    background: var(--surface-inset);
+    box-shadow: none;
+    -webkit-app-region: drag;
+}
+.interview-shell .command-item { min-height: 28px; }
+.interview-shell #micButton { display: none !important; }
+.interview-shell .command-item span { color: var(--ink-muted); }
+.interview-shell .status-dot { margin-left: auto; }
+.interview-shell .shortcuts-popover { top: 48px; z-index: 20; max-height: calc(100vh - 64px); overflow: auto; }
+
+.interview-workspace { flex: 1; min-height: 0; overflow: auto; -webkit-app-region: no-drag; scrollbar-gutter: stable; }
+#interviewPanel { color: var(--ink); padding: 20px 24px; font-size: 14px; line-height: 1.55; }
+.interview-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.interview-button {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-control);
+    background: var(--surface-raised);
+    color: var(--ink);
+    min-height: 34px;
+    padding: 7px 11px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.interview-button:hover:not(:disabled) { background: #2c3850; border-color: #596782; }
+.interview-button.primary { background: var(--accent); border-color: var(--accent); color: #14213f; }
+.interview-button.primary:hover:not(:disabled) { background: #c2ceff; }
+#interviewPanel select, #interviewStrip select {
+    min-height: 34px;
+    max-width: 100%;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-control);
+    padding: 6px 9px;
+    background: var(--surface-inset);
+    color: var(--ink);
+    font-size: 12px;
+}
+#interviewLevel { width: 46px; height: 8px; accent-color: var(--accent); }
+#interviewLevel::-webkit-meter-bar { background: var(--line); border: none; }
+#interviewLevel::-webkit-meter-optimum-value { background: var(--accent); }
+.interview-status { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 12px; font-size: 12px; color: var(--ink-muted); }
+#captureStatus::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 7px; background: #758299; }
+#captureStatus[data-state="listening"]::before { background: #92c7b6; }
+#captureStatus[data-state="error"]::before { background: #f0a5a5; }
+/* Turn status: the acoustic turn detector's own phase, shown alongside
+   captureStatus only while capture is active (see interview-panel.js). */
+#turnStatus::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 7px; background: #758299; }
+#turnStatus[data-state="speaking"]::before { background: #92c7b6; }
+#turnStatus[data-state="transcribing"]::before, #turnStatus[data-state="waiting"]::before { background: #e0c169; }
+#turnStatus[data-state="ready"]::before { background: #92c7b6; }
+.interview-mode-row { display: flex; align-items: center; gap: 12px; padding: 14px 0 18px; color: var(--ink-muted); font-size: 12px; border-bottom: 1px solid var(--line); }
+.interview-question { margin-top: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.interview-question h2 { font-size: 12px; color: var(--ink-muted); font-weight: 500; margin: 0 0 6px; }
+#interviewQuestion { font-size: 19px; font-weight: 500; line-height: 1.45; margin: 0 0 16px; overflow-wrap: anywhere; }
+.interview-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.interview-actions .interview-button { min-height: 30px; padding: 5px 9px; font-size: 11px; }
+.interview-answer { max-width: 72ch; padding: 10px 0; font-size: 15px; line-height: 1.65; overflow-wrap: anywhere; user-select: text; }
+.interview-answer p { margin: 9px 0; }
+.interview-answer > p:first-child { font-size: 17px; line-height: 1.6; color: #fff; }
+.interview-answer h2, .interview-answer h3, .interview-answer h4 { font-size: 15px; margin: 22px 0 8px; font-weight: 650; }
+.interview-answer ul, .interview-answer ol { padding-left: 23px; }
+.interview-answer li { margin: 6px 0; }
+.interview-answer pre, .message-text pre { max-width: 100%; overflow-x: auto; white-space: pre; padding: 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-inset); }
+.interview-answer code { font-family: Consolas, 'Cascadia Code', monospace; font-size: .88em; background: var(--surface-inset); padding: 2px 4px; border-radius: 3px; }
+.interview-answer pre code { padding: 0; background: transparent; overflow-wrap: normal; }
+.interview-answer .interview-empty { color: var(--ink-muted); font-size: 15px; padding: 18px 0; }
+.interview-notice { padding: 10px 12px; border: 1px solid #7d5f54; border-radius: 7px; background: #302729; color: #f2c9b5; font-size: 13px; overflow-wrap: anywhere; }
+.interview-history { margin-top: 12px; border-top: 1px solid var(--line); color: var(--ink-muted); }
+.interview-history summary { cursor: pointer; padding: 13px 0; font-size: 12px; }
+#interviewHistory > details { border-top: 1px solid var(--line); }
+#interviewHistory > details > summary { font-size: 14px; color: var(--ink); }
+#interviewHistory .interview-answer { color: var(--ink); }
+.interview-compose { display: flex; align-items: flex-end; gap: 10px; flex-shrink: 0; padding: 14px 20px; border-top: 1px solid var(--line); background: var(--surface-inset); }
+.interview-compose textarea, #interviewEdit { width: 100%; resize: vertical; min-height: 42px; max-height: 140px; background: var(--surface-inset); color: var(--ink); border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px; font-size: 14px; line-height: 1.5; }
+#interviewEdit { margin-bottom: 12px; }
+.interview-compose textarea::placeholder { color: var(--ink-muted); }
+
+.interview-chat .chat-container { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-window); box-shadow: none; height: 100vh; }
+.interview-chat .chat-header, .interview-chat .chat-input { background: var(--surface-inset); border-color: var(--line); flex-shrink: 0; }
+.interview-chat .chat-header { padding: 13px 24px; }
+.interview-chat .chat-messages { overflow: visible; padding: 0 24px; flex: none; }
+.interview-chat .chat-messages:empty { display: none; }
+.interview-chat .chat-input { padding: 12px 24px; }
+.interview-chat .input-field { background: var(--surface-inset); color: var(--ink); border-color: var(--line); font-size: 14px; }
+.interview-chat .send-button { background: var(--accent); color: #14213f; }
+.interview-chat .message { background: transparent; border: 0; border-top: 1px solid var(--line); padding: 14px 0; border-radius: 0; }
+.interview-chat .message-text { color: var(--ink); line-height: 1.65; font-size: 15px; white-space: normal; }
+.interview-chat .message.user .message-text { white-space: pre-wrap; }
+.interview-chat .message-time { color: var(--ink-muted); }
+
+.settings-container, .wizard { background: var(--surface) !important; color: var(--ink); border-color: var(--line) !important; }
+.settings-container .settings-header, .settings-container .settings-section, .wizard .header, .wizard .footer { background: var(--surface-inset); border-color: var(--line); }
+.settings-container .settings-section { border-radius: 9px; box-shadow: none; }
+.settings-container .settings-content { min-height: 0; }
+.settings-container .settings-item-description, .settings-container .settings-note { color: var(--ink-muted); font-size: 12px; line-height: 1.6; }
+.settings-container .input-field { background: var(--surface-raised); border: 1px solid var(--line); font-size: 13px; min-height: 36px; }
+.settings-container .settings-item { flex-wrap: wrap; gap: 12px; }
+.settings-container .settings-section-title { font-size: 15px; color: var(--ink); }
+.settings-container .settings-item-label { color: var(--ink); }
+.settings-container .settings-item > div { flex: 1; min-width: 160px; }
+.wizard { --bg: var(--surface); --bg-card: var(--surface-raised); --bg-elevated: var(--surface-inset); --text: var(--ink); --text-dim: var(--ink-muted); --text-faint: var(--ink-muted); --border: var(--line); --accent-hover: #c2ceff; }
+.wizard .hero-logo { background: var(--surface-raised); box-shadow: none; color: var(--accent); }
+.wizard::before, .wizard::after { display: none; }
+.wizard .content { min-height: 0; }
+
+@media (max-width: 520px) {
+    #interviewPanel { padding: 16px; }
+    .interview-controls { gap: 6px; }
+    .interview-controls .interview-button { padding: 6px 8px; }
+    #interviewLevel { width: 30px; }
+    .interview-compose, .interview-chat .chat-input { padding: 12px 16px; }
+    #interviewQuestion { font-size: 17px; }
+    .settings-container .input-field { max-width: 100%; width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
