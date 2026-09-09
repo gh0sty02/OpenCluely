@@ -387,6 +387,7 @@ const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
 const WhisperWorkerService = require('./whisper-worker.service');
+const mistralService = require('./mistral.service');
 
 let sdk = null;
 try {
@@ -421,19 +422,25 @@ class SpeechService extends EventEmitter {
     this.segmentBytes = 0;
     this.segmentTimer = null;
     this.transcriptionInFlight = false;
-    this.pendingFlush = false;
-    this.pendingFinal = false;
+    this.pendingSegments = [];
     this.audioProgram = null;
     this.whisperCommand = null;
     this.whisperWorker = new WhisperWorkerService();
     this.isProcessingAudio = false;
     this.manualStopRequested = false;
+    this.captureId = 0;
+    this.utteranceSequence = 0;
+    this.transcriptionTask = null;
+    this.stopTask = null;
     this._resetVadState();
 
     this.initializeClient();
   }
 
   initializeClient() {
+    this.captureId++;
+    this.isRecording = false;
+    this.isProcessingAudio = false;
     this._cleanup();
     this.provider = 'disabled';
     this.available = false;
@@ -453,7 +460,12 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    const reason = 'Speech recognition disabled. Configure Azure or local Whisper.';
+    if (provider === 'mistral') {
+      this._initializeMistralClient();
+      return;
+    }
+
+    const reason = 'Speech recognition disabled. Configure Azure, local Whisper, or Mistral.';
     logger.warn(reason);
     this.emit('status', reason);
   }
@@ -462,10 +474,6 @@ class SpeechService extends EventEmitter {
     try {
       if (!sdk) {
         throw new Error('Azure Speech SDK dependency is not installed');
-      }
-
-      if (!recorder || typeof recorder.record !== 'function') {
-        throw new Error('Local microphone recorder dependency is not installed');
       }
 
       const subscriptionKey = this._getSetting('azureKey') || process.env.AZURE_SPEECH_KEY;
@@ -539,6 +547,30 @@ class SpeechService extends EventEmitter {
     }
   }
 
+  _initializeMistralClient() {
+    try {
+      if (!mistralService.getApiKey(this._getSetting('mistralKey'))) {
+        const reason = 'Mistral API key not found. Set MISTRAL_API_KEY or configure it in Settings.';
+        logger.warn(reason);
+        this.emit('status', reason);
+        return;
+      }
+
+      this.available = true;
+      logger.info('Mistral Voxtral speech service initialized successfully', {
+        model: config.get('speech.mistral.model') || 'voxtral-mini-latest'
+      });
+      this.emit('status', 'Mistral Voxtral ready');
+    } catch (error) {
+      logger.error('Failed to initialize Mistral speech client', {
+        error: error.message,
+        stack: error.stack
+      });
+      this.available = false;
+      this.emit('status', 'Mistral speech unavailable');
+    }
+  }
+
   startRecording() {
     try {
       if (!this.available) {
@@ -560,13 +592,19 @@ class SpeechService extends EventEmitter {
 
       this.sessionStartTime = Date.now();
       this.retryCount = 0;
+      this.captureId++;
+      this.utteranceSequence = 0;
+      this.stopTask = null;
 
       if (this.provider === 'azure') {
         this._startAzureRecording();
         return;
       }
 
-      if (this.provider === 'whisper') {
+      // Mistral shares the exact same renderer-capture/VAD/buffering pipeline
+      // as local Whisper — only the final "transcribe this WAV" step differs
+      // (see _transcribeWhisperBuffer / recognizeFromFile).
+      if (this.provider === 'whisper' || this.provider === 'mistral') {
         this._startWhisperRecording();
         return;
       }
@@ -584,24 +622,25 @@ class SpeechService extends EventEmitter {
       throw new Error('Azure Speech client not initialized');
     }
 
-    this.isRecording = true;
-    this.emit('recording-started');
-    this.emit('status', 'Azure recording started');
     this._cleanup();
+    const captureId = this.captureId;
+    this.isRecording = true;
+    this.useRendererCapture = true;
 
     try {
       this.pushStream = sdk.AudioInputStream.createPushStream();
       this.audioConfig = sdk.AudioConfig.fromStreamInput(this.pushStream);
-      this._startMicrophoneCapture();
       this.recognizer = new sdk.SpeechRecognizer(this.speechConfig, this.audioConfig);
     } catch (error) {
       logger.error('Failed to start Azure recording session', { error: error.message });
       this.emit('error', `Audio configuration failed: ${error.message}`);
       this.isRecording = false;
+      this._cleanup();
       return;
     }
 
     this.recognizer.recognizing = (s, e) => {
+      if (this.captureId !== captureId) return;
       try {
         if (e.result.reason === sdk.ResultReason.RecognizingSpeech) {
           this.emit('interim-transcription', e.result.text);
@@ -612,9 +651,10 @@ class SpeechService extends EventEmitter {
     };
 
     this.recognizer.recognized = (s, e) => {
+      if (this.captureId !== captureId) return;
       try {
         if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text && e.result.text.trim()) {
-          this.emit('transcription', e.result.text);
+          this.emit('transcription', e.result.text, { captureId, utteranceId: e.result.resultId || `${captureId}:${++this.utteranceSequence}` });
         }
       } catch (error) {
         logger.error('Error in recognized handler', { error: error.message });
@@ -622,6 +662,7 @@ class SpeechService extends EventEmitter {
     };
 
     this.recognizer.canceled = (s, e) => {
+      if (this.captureId !== captureId) return;
       logger.warn('Recognition session canceled', {
         reason: e.reason,
         errorCode: e.errorCode,
@@ -651,10 +692,12 @@ class SpeechService extends EventEmitter {
     };
 
     this.recognizer.sessionStopped = () => {
+      if (this.captureId !== captureId) return;
       this.stopRecording();
     };
 
     const startTimeout = setTimeout(() => {
+      if (this.captureId !== captureId || !this.isRecording) return;
       logger.error('Recognition start timeout');
       this.emit('error', 'Speech recognition start timeout. Please try again.');
       this.stopRecording();
@@ -667,12 +710,15 @@ class SpeechService extends EventEmitter {
       },
       (error) => {
         clearTimeout(startTimeout);
+        if (this.captureId !== captureId) return;
         logger.error('Failed to start continuous recognition', { error: error.toString() });
         this.emit('error', `Recognition startup failed: ${error}`);
         this.isRecording = false;
         this._cleanup();
       }
     );
+    this.emit('recording-started', { captureId, useRendererCapture: true });
+    this.emit('status', 'Azure recording started');
   }
 
   _startWhisperRecording() {
@@ -681,12 +727,12 @@ class SpeechService extends EventEmitter {
     this.segmentBuffers = [];
     this.segmentBytes = 0;
     this.transcriptionInFlight = false;
-    this.pendingFlush = false;
-    this.pendingFinal = false;
+    this.pendingSegments = [];
     this.manualStopRequested = false;
     this._resetVadState();
-    this.emit('recording-started');
-    this.emit('status', 'Local Whisper recording started');
+    this.useRendererCapture = true;
+    this.emit('recording-started', { captureId: this.captureId, useRendererCapture: true });
+    this.emit('status', 'Waiting for selected audio source');
 
     if (this.whisperWorker.isConfigured()) {
       this.whisperWorker.warmup({
@@ -706,23 +752,6 @@ class SpeechService extends EventEmitter {
       });
     }
 
-    // Capture microphone audio in the renderer via the Web Audio API on Windows
-    // and macOS. Windows lacks the Unix sox/rec/arecord tools node-record-lpcm16
-    // needs; macOS would otherwise require a Homebrew `sox` install (not bundled)
-    // and a child-process mic that the system TCC prompt can't attribute. The
-    // renderer path uses getUserMedia, which macOS prompts for cleanly via the
-    // app's NSMicrophoneUsageDescription. Linux keeps the native recorder path.
-    this.useRendererCapture = process.platform === 'win32' || process.platform === 'darwin';
-    if (this.useRendererCapture) {
-      this.emit('status', 'Waiting for microphone audio…');
-      // The renderer starts sending chunks once it receives the recording-started event.
-      if (!this._isManualCaptureMode()) {
-        this._startSegmentWatchdog();
-      }
-      return;
-    }
-
-    this._startMicrophoneCapture();
     if (!this._isManualCaptureMode()) {
       this._startSegmentWatchdog();
     }
@@ -759,7 +788,7 @@ class SpeechService extends EventEmitter {
       clearInterval(this.segmentTimer);
     }
     this.segmentTimer = setInterval(() => {
-      if (!this.isRecording || this.provider !== 'whisper') {
+      if (!this.isRecording || (this.provider !== 'whisper' && this.provider !== 'mistral')) {
         return;
       }
 
@@ -788,14 +817,15 @@ class SpeechService extends EventEmitter {
    * the current Whisper segment buffer.
    */
   handleAudioChunkFromRenderer(chunk) {
-    if (!this.isRecording || this.provider !== 'whisper' || !this.useRendererCapture) {
+    if (!this.isRecording || !this.useRendererCapture) {
       return;
     }
-    if (!chunk || !chunk.length) {
+    if (!chunk || !(chunk.length || chunk.byteLength)) {
       return;
     }
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    this._ingestWhisperAudio(buffer);
+    if (buffer.length % 2) return;
+    this._handleAudioChunk(buffer);
   }
 
   /**
@@ -885,6 +915,10 @@ class SpeechService extends EventEmitter {
         this.segmentBuffers.push(buffer);
         this.segmentBytes += buffer.length;
         this.vadSpeechMs += chunkMs;
+        // Real-time onset signal — fires the instant speech resumes, well
+        // before this segment is transcribed, so a pending auto-answer timer
+        // can be held off without waiting on Whisper latency.
+        this.emit('speech-activity', { captureId: this.captureId });
       } else {
         // Background: adapt the noise floor and keep a short pre-roll ring.
         this.vadNoiseFloor = this.vadNoiseFloor * 0.95 + energy * 0.05;
@@ -934,7 +968,11 @@ class SpeechService extends EventEmitter {
     this.vadSilenceMs = 0;
     this.vadPreRoll = [];
     this.vadPreRollMs = 0;
-    this._flushWhisperSegment({ final: false }).catch((error) => {
+    // Captured now, before transcription work begins, so downstream
+    // silence-gap timing reflects when the speaker actually stopped talking
+    // rather than however long Whisper took to process this segment.
+    const speechEndedAt = Date.now();
+    this._flushWhisperSegment(speechEndedAt).catch((error) => {
       logger.error('Whisper segment transcription failed', { error: error.message });
     });
   }
@@ -944,9 +982,18 @@ class SpeechService extends EventEmitter {
     return buffer.length / 32;
   }
 
-  stopRecording() {
+  /**
+   * @param {{cancel?: boolean}} [options] `cancel: true` discards buffered and
+   *   in-flight Whisper/Mistral audio instead of transcribing it (used when the
+   *   user pauses/restarts capture rather than finishing an utterance). Returns
+   *   a promise that resolves once the stop (including any final transcription)
+   *   has settled, so callers can sequence work after a real stop.
+   */
+  stopRecording(options = {}) {
+    const { cancel = false } = options;
+
     if (!this.isRecording) {
-      return;
+      return Promise.resolve();
     }
 
     this.isRecording = false;
@@ -957,32 +1004,57 @@ class SpeechService extends EventEmitter {
     });
 
     if (this.provider === 'azure' && this.recognizer) {
-      try {
-        this.recognizer.stopContinuousRecognitionAsync(
-          () => {
-            this._finalizeStop('Recording stopped');
-          },
-          (error) => {
-            logger.error('Error during recognition stop', { error: error.toString() });
-            this._finalizeStop('Recording stopped');
-          }
-        );
-      } catch (error) {
-        logger.error('Error stopping recognizer', { error: error.message });
-        this._finalizeStop('Recording stopped');
-      }
-      return;
+      return new Promise((resolve) => {
+        try {
+          this.recognizer.stopContinuousRecognitionAsync(
+            () => {
+              this._finalizeStop('Recording stopped');
+              resolve();
+            },
+            (error) => {
+              logger.error('Error during recognition stop', { error: error.toString() });
+              this._finalizeStop('Recording stopped');
+              resolve();
+            }
+          );
+        } catch (error) {
+          logger.error('Error stopping recognizer', { error: error.message });
+          this._finalizeStop('Recording stopped');
+          resolve();
+        }
+      });
     }
 
-    if (this.provider === 'whisper') {
+    if (this.provider === 'whisper' || this.provider === 'mistral') {
+      if (cancel) {
+        this._cancelWhisperSession();
+        return Promise.resolve();
+      }
       this.isProcessingAudio = true;
       this.emit('recording-stopped');
-      this.emit('status', 'Processing local speech…');
-      this._finalizeWhisperStop({ captureAlreadyStopped: true });
-      return;
+      this.emit('status', 'Processing speech…');
+      return this._finalizeWhisperStop({ captureAlreadyStopped: true });
     }
 
     this._finalizeStop('Recording stopped');
+    return Promise.resolve();
+  }
+
+  /**
+   * Abort the current Whisper/Mistral session without transcribing what's
+   * buffered or in flight. In-flight transcriptions resolve later but are
+   * discarded because their captureId no longer matches once a new session
+   * starts (see `_runWhisperTranscription`).
+   */
+  _cancelWhisperSession() {
+    while (this.pendingSegments.length) {
+      const item = this.pendingSegments.shift();
+      item.resolve();
+    }
+    this.isProcessingAudio = false;
+    this._cleanup();
+    this.emit('recording-stopped');
+    this.emit('status', 'Recording stopped');
   }
 
   async _finalizeWhisperStop({ captureAlreadyStopped = false } = {}) {
@@ -1001,7 +1073,7 @@ class SpeechService extends EventEmitter {
     }
 
     try {
-      await this._flushWhisperSegment({ final: true });
+      await this._flushWhisperSegment();
     } catch (error) {
       logger.error('Final Whisper transcription failed', { error: error.message });
       this.emit('error', `Whisper transcription failed: ${error.message}`);
@@ -1071,8 +1143,7 @@ class SpeechService extends EventEmitter {
     this.segmentBuffers = [];
     this.segmentBytes = 0;
     this.transcriptionInFlight = false;
-    this.pendingFlush = false;
-    this.pendingFinal = false;
+    this.pendingSegments = [];
     this._resetVadState();
     this._audioDataLogged = false;
     this.useRendererCapture = false;
@@ -1109,6 +1180,10 @@ class SpeechService extends EventEmitter {
 
     if (this.provider === 'whisper') {
       return this._transcribeWhisperFile(audioFilePath);
+    }
+
+    if (this.provider === 'mistral') {
+      return this._transcribeMistralFile(audioFilePath);
     }
 
     throw new Error('Speech service not initialized');
@@ -1154,6 +1229,10 @@ class SpeechService extends EventEmitter {
       };
     }
 
+    if (this.provider === 'mistral') {
+      return mistralService.testConnection(this._getSetting('mistralKey'));
+    }
+
     return { success: false, message: 'Speech service not initialized' };
   }
 
@@ -1162,7 +1241,9 @@ class SpeechService extends EventEmitter {
       provider: this.provider,
       isRecording: this.isRecording,
       isProcessingAudio: this.isProcessingAudio,
-      isInitialized: this.provider === 'azure' ? !!this.speechConfig : !!this.whisperCommand,
+      isInitialized: this.provider === 'azure'
+        ? !!this.speechConfig
+        : this.provider === 'mistral' ? !!this.available : !!this.whisperCommand,
       sessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0,
       retryCount: this.retryCount,
       effectiveSettings: {
@@ -1175,11 +1256,13 @@ class SpeechService extends EventEmitter {
         whisperLanguage: this._getWhisperLanguage(),
         whisperCaptureMode: this._getWhisperCaptureMode(),
         whisperDevice: this._getWhisperDevice(),
-        whisperSegmentMs: String(this._getWhisperSegmentMs())
+        whisperSegmentMs: String(this._getWhisperSegmentMs()),
+        mistralKeyConfigured: !!mistralService.getApiKey(this._getSetting('mistralKey'))
       },
       config: {
         azure: config.get('speech.azure') || {},
         whisper: config.get('speech.whisper') || {},
+        mistral: config.get('speech.mistral') || {},
         selectedProvider: this.provider
       }
     };
@@ -1194,11 +1277,15 @@ class SpeechService extends EventEmitter {
       return !!this.whisperCommand && !!this.available;
     }
 
+    if (this.provider === 'mistral') {
+      return !!this.available;
+    }
+
     return false;
   }
 
   isManualCaptureMode() {
-    return this.provider === 'whisper' && this._getWhisperCaptureMode() === 'manual';
+    return (this.provider === 'whisper' || this.provider === 'mistral') && this._getWhisperCaptureMode() === 'manual';
   }
 
   shutdown() {
@@ -1209,7 +1296,7 @@ class SpeechService extends EventEmitter {
   }
 
   updateSettings(settings = {}) {
-    const speechKeys = ['speechProvider', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
+    const speechKeys = ['speechProvider', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs', 'mistralKey'];
     let changed = false;
 
     for (const key of speechKeys) {
@@ -1229,7 +1316,7 @@ class SpeechService extends EventEmitter {
   _getConfiguredProvider() {
     const provider = String(this._getSetting('speechProvider') || process.env.SPEECH_PROVIDER || '').trim().toLowerCase();
 
-    if (provider === 'azure' || provider === 'whisper') {
+    if (provider === 'azure' || provider === 'whisper' || provider === 'mistral') {
       return provider;
     }
 
@@ -1801,23 +1888,32 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    if (this.provider === 'whisper') {
+    if (this.provider === 'whisper' || this.provider === 'mistral') {
       this._ingestWhisperAudio(Buffer.from(chunk));
     }
   }
 
-  async _flushWhisperSegment({ final }) {
+  /**
+   * Flush the accumulated segment for transcription. Utterances are queued
+   * individually (rather than merged) when a transcription is already in
+   * flight, so a burst of quick utterances each get their own identity and
+   * transcript instead of losing all but the first to the buffer that was
+   * already claimed by the in-flight request. The returned promise resolves
+   * once THIS segment's transcription attempt (direct or queued) settles.
+   */
+  async _flushWhisperSegment(speechEndedAt = Date.now()) {
+    const captureId = this.captureId;
+
     if (this.transcriptionInFlight) {
-      // A flush was requested while a transcription is still running. Record
-      // that we owe a follow-up flush for ANY request (not just a final one),
-      // otherwise an utterance that ended mid-transcription stays stranded in
-      // the buffer until the next utterance ends or the session stops. Track
-      // final-ness separately so a queued stop still finalises correctly.
-      this.pendingFlush = true;
-      if (final) {
-        this.pendingFinal = true;
+      if (!this.segmentBytes) {
+        return;
       }
-      return;
+      const audioBuffer = Buffer.concat(this.segmentBuffers, this.segmentBytes);
+      this.segmentBuffers = [];
+      this.segmentBytes = 0;
+      return new Promise((resolve, reject) => {
+        this.pendingSegments.push({ buffer: audioBuffer, captureId, speechEndedAt, resolve, reject });
+      });
     }
 
     if (!this.segmentBytes) {
@@ -1828,25 +1924,46 @@ class SpeechService extends EventEmitter {
     this.segmentBuffers = [];
     this.segmentBytes = 0;
 
+    await this._runWhisperTranscription(audioBuffer, captureId, speechEndedAt);
+  }
+
+  /** Transcribe one segment, then hand off to the next queued segment (if any). */
+  async _runWhisperTranscription(audioBuffer, captureId, speechEndedAt = Date.now()) {
     this.transcriptionInFlight = true;
+    const utteranceId = `${captureId}:${++this.utteranceSequence}`;
 
     try {
       const transcript = await this._transcribeWhisperBuffer(audioBuffer);
+      if (this.captureId !== captureId) {
+        // A newer session started (pause/cancel + restart) while this
+        // transcription was in flight; its result is stale, discard it.
+        return;
+      }
       const clean = transcript ? transcript.trim() : '';
       if (clean && !this._isHallucinatedTranscript(clean)) {
-        this.emit('transcription', clean);
+        this.emit('transcription', clean, { captureId, utteranceId, speechEndedAt });
       } else if (clean) {
         logger.debug('Dropped likely Whisper silence hallucination', { transcript: clean });
       }
     } finally {
-      this.transcriptionInFlight = false;
-
-      if (this.pendingFlush) {
-        this.pendingFlush = false;
-        const runFinal = this.pendingFinal;
-        this.pendingFinal = false;
-        await this._flushWhisperSegment({ final: runFinal });
+      if (this.captureId === captureId) {
+        this.transcriptionInFlight = false;
       }
+      await this._drainPendingSegments();
+    }
+  }
+
+  /** Process the next queued segment, settling its caller's promise. */
+  async _drainPendingSegments() {
+    if (!this.pendingSegments.length) {
+      return;
+    }
+    const next = this.pendingSegments.shift();
+    try {
+      await this._runWhisperTranscription(next.buffer, next.captureId, next.speechEndedAt);
+      next.resolve();
+    } catch (error) {
+      next.reject(error);
     }
   }
 
@@ -1886,10 +2003,20 @@ class SpeechService extends EventEmitter {
 
     try {
       fs.writeFileSync(audioFilePath, this._createWavBuffer(audioBuffer));
+      if (this.provider === 'mistral') {
+        return await this._transcribeMistralFile(audioFilePath);
+      }
       return await this._transcribeWhisperFile(audioFilePath);
     } finally {
       this._removeTempDir(tempDir);
     }
+  }
+
+  async _transcribeMistralFile(audioFilePath) {
+    return mistralService.transcribeFile(audioFilePath, {
+      apiKey: this._getSetting('mistralKey'),
+      language: this._getWhisperLanguage()
+    });
   }
 
   async _transcribeWhisperFile(audioFilePath) {
