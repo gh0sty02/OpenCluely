@@ -121,3 +121,7 @@ class Logger {
 }
 
 module.exports = new Logger();
+// Exposed for direct unit testing of the redaction logic (the real
+// formatter, not a stub). Not part of the logger's day-to-day API surface.
+module.exports.redactMeta = redactMeta;
+module.exports.redactValue = redactValue;

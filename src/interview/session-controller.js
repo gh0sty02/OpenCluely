@@ -30,8 +30,8 @@ class SessionController extends EventEmitter {
     this.activeCaptureId = null;
     // Content-free latency diagnostics: the acoustic pipeline's speech-ended
     // and transcript-ready moments for the *current* turn, captured as they
-    // happen (not deferred to submit time, since turnDetector.cancel() —
-    // called from answerNow() before submit() — would already have wiped
+    // happen (not deferred to submit time, because turnDetector.cancel(),
+    // called from answerNow() before submit() runs, would already have wiped
     // them) so LatencyMetrics can measure real transcription and
     // silence-wait durations.
     this._pendingSpeechEndedAt = null;
@@ -90,7 +90,7 @@ class SessionController extends EventEmitter {
   }
   noteSpeechStarted(event) {
     // A fresh utterance invalidates any transcript-ready mark left over from
-    // an earlier utterance in this turn — the turn isn't done yet.
+    // an earlier utterance in this turn, since the turn isn't done yet.
     const wasActive = this.turnDetector.snapshot().speakerActive;
     this.turnDetector.noteSpeechStarted(event);
     if (!wasActive && this.turnDetector.snapshot().speakerActive) this._pendingTranscriptReadyAt = null;
@@ -98,8 +98,8 @@ class SessionController extends EventEmitter {
   noteSpeechEnded(event) {
     this.turnDetector.noteSpeechEnded(event);
     // Mirror the turn detector's own (max-tracked) speechEndedAt onto the
-    // controller immediately, because answerNow() calls turnDetector.cancel()
-    // — which clears it — before submit() runs. Reading it lazily at submit
+    // controller immediately, because answerNow() calls turnDetector.cancel(),
+    // which clears it, before submit() runs. Reading it lazily at submit
     // time would see null instead of the acoustic layer's real timestamp.
     const speechEndedAt = this.turnDetector.snapshot().speechEndedAt;
     if (Number.isFinite(speechEndedAt)) this._pendingSpeechEndedAt = speechEndedAt;
@@ -110,7 +110,7 @@ class SessionController extends EventEmitter {
     this.turnDetector.noteTranscriptionSettled(event);
     const after = this.turnDetector.snapshot();
     // Content-free latency mark: the moment the *last* pending transcription
-    // job settles (not every settle — only the transition to zero pending
+    // job settles (not every settle, only the transition to zero pending
     // while nobody is speaking) is "transcript ready" for this turn.
     if (pendingBefore > 0 && after.pendingTranscriptions === 0 && !after.speakerActive) {
       this._pendingTranscriptReadyAt = this.now();
@@ -180,7 +180,7 @@ class SessionController extends EventEmitter {
     const q = { id: randomUUID(), text: text.trim(), source, state: 'queued', answer: '', error: '', requestId: null };
     // Question commitment, marked before the question enters the answer
     // queue. Only a spoken turn carries acoustic stages (speechEndedAt /
-    // transcriptReadyAt) — a typed question has neither.
+    // transcriptReadyAt); a typed question has neither.
     if (this.metrics) {
       const speechEndedAt = source === 'typed' ? null : this._pendingSpeechEndedAt;
       const transcriptReadyAt = source === 'typed' ? null : this._pendingTranscriptReadyAt;
@@ -201,6 +201,10 @@ class SessionController extends EventEmitter {
     if (this.queue.length >= 3) {
       q.state = 'overflow';
       q.error = 'The answer queue is full. Retry this question when a slot opens.';
+      // This question never enters `this.queue`, so it will never reach
+      // _pump(), _cancelQueued, or _cancelActive. Close its metrics record
+      // now instead of leaving it dangling in the active ring.
+      if (this.metrics) this.metrics.fail(q.id, this.now(), 'OVERFLOW');
     } else this.queue.push(q);
     this.publish();
     this._pump();
@@ -212,7 +216,7 @@ class SessionController extends EventEmitter {
     if (!q || !['error', 'cancelled', 'overflow', 'completed'].includes(q.state)) return;
     if (this.queue.length >= 3) throw new Error('The answer queue is full. Try again after an answer completes.');
     q.state = 'queued'; q.error = ''; q.answer = ''; q.requestId = null;
-    // A retry has no fresh acoustic stages of its own — track only
+    // A retry has no fresh acoustic stages of its own, so track only
     // commitment onward.
     if (this.metrics) {
       this.metrics.begin(q.id, { source: q.source, warm: this._answeredCount > 0 });
@@ -229,7 +233,7 @@ class SessionController extends EventEmitter {
     this.publish(); this._pump();
   }
   // A queued (not yet generating) question was cancelled before it ever
-  // reached _pump() — close out its latency record with the same
+  // reached _pump(), so close out its latency record with the same
   // content-free 'CANCELLED' terminal event an aborted in-flight answer
   // gets, instead of leaving it to expire silently out of the active ring.
   _cancelQueued(q) {
@@ -255,7 +259,7 @@ class SessionController extends EventEmitter {
     this.active = null;
     active.question.state = 'cancelled';
     // The generate() promise's own .catch() guards on isCurrent(), which is
-    // already false the instant `this.active` is cleared above — so its
+    // already false the instant `this.active` is cleared above, so its
     // eventual (possibly late) settlement will never reach the metrics
     // terminal marks below. Record cancellation here, at the moment the
     // controller itself decided the turn was over.

@@ -185,10 +185,10 @@ test('logs a sanitized record with no prompt, transcript, answer, or credential 
 
   assert.ok(loggedCalls.length >= 1);
   // Only the shape (field names, and the fixed diagnostic message) is
-  // allowed to mention these words — no logged *meta value* may contain
+  // allowed to mention these words, not any logged *meta value* containing
   // prompt/transcript/answer/credential content. ("transcriptionMs" is an
   // expected field name, and "interview answer latency" a fixed message;
-  // neither should trip this — only dynamic values matter.)
+  // neither should trip this, since only dynamic values matter.)
   const values = [];
   const collectValues = value => {
     if (value && typeof value === 'object') Object.values(value).forEach(collectValues);

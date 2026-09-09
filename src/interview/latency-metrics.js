@@ -2,7 +2,7 @@
 
 // Content-free latency diagnostics for one interview turn's answer pipeline.
 //
-// LatencyMetrics never sees the question text, transcript, or answer — only
+// LatencyMetrics never sees the question text, transcript, or answer, only
 // question/request IDs, provider/model/source metadata, and stage
 // timestamps supplied by the caller. It tracks a bounded ring of in-flight
 // ("active") records and a bounded ring of finished ("completed") records,
@@ -57,7 +57,7 @@ class LatencyMetrics {
 
   // Begin tracking one question's answer pipeline. `context` may carry the
   // acoustic speechEndedAt timestamp plus provider/model/source/warm
-  // metadata — never question/transcript/answer text.
+  // metadata, never question/transcript/answer text.
   begin(id, context = {}) {
     if (typeof id !== 'string' || !id) return null;
     if (!this.active.has(id) && this.active.size >= this.activeLimit) {

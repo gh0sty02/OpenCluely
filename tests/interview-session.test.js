@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-// LatencyMetrics (pulled in below) logs through src/core/logger — stub it
+// LatencyMetrics (pulled in below) logs through src/core/logger, so stub it
 // the same way tests/interview-prompts.test.js and
 // tests/provider-streaming.test.js do, so these tests don't touch disk.
 const loggerPath = require.resolve('../src/core/logger');
@@ -209,7 +209,7 @@ test('queue saturation preserves overflow for explicit submission', () => {
   assert.equal(controller.snapshot().questions[4].text, 'Question 4?');
 });
 
-test('a transcript never dispatches on its own — only an explicit action does', () => {
+test('a transcript never dispatches on its own, only an explicit action does', () => {
   const { controller, calls, transcript } = setup();
   transcript('Could you explain that?', 'mic-1', 'microphone');
   assert.equal(calls.length, 0);
@@ -222,7 +222,7 @@ test('system-audio speech accumulates in the draft and never auto-dispatches, ev
   transcript('Tell me about yourself');
   assert.equal(calls.length, 0);
   assert.equal(controller.snapshot().draft, 'Tell me about yourself');
-  // No timer exists to advance — this stands in for "arbitrarily long silence".
+  // No timer exists to advance; this stands in for "arbitrarily long silence".
   transcript('and your background');
   assert.equal(calls.length, 0);
   assert.equal(controller.snapshot().draft, 'Tell me about yourself and your background');
@@ -363,7 +363,7 @@ test('latency metrics: a spoken turn records transcription, endpoint wait, first
   const { clock, controller, calls, metrics } = setupTurnLifecycleWithMetrics();
   // Drive the acoustic lifecycle by hand (not via the atomic settleTranscript
   // helper) so real elapsed time separates "speech ended", "transcript
-  // ready", and "turn committed" — matching how the app actually runs.
+  // ready", and "turn committed", matching how the app actually runs.
   controller.noteSpeechEnded({ captureId: 7, utteranceId: 'u1', speechEndedAt: 1000 });
   controller.noteTranscriptionStarted({ captureId: 7, utteranceId: 'u1', speechEndedAt: 1000 });
   clock.advance(300); // transcription work takes 300ms
@@ -458,6 +458,29 @@ test('latency metrics: a question cancelled while still queued closes out its re
   assert.equal(metrics.complete(queuedId, clock.now()), null);
 });
 
+test('latency metrics: a question that overflows the queue closes out its record instead of leaking', () => {
+  const clock = createClock(1000);
+  const metrics = new LatencyMetrics();
+  const calls = [];
+  const controller = new SessionController({
+    generate: (question, options) => new Promise((resolve, reject) => calls.push({ question, options, resolve, reject })),
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, metrics
+  });
+  controller.startSession();
+  controller.submit('First?', 'typed'); // becomes active immediately
+  controller.submit('Second?', 'typed'); // queued
+  controller.submit('Third?', 'typed'); // queued
+  controller.submit('Fourth?', 'typed'); // queued, queue is now at its cap of 3
+  const overflowId = controller.submit('Fifth?', 'typed'); // overflow: queue already has 3
+  assert.equal(controller.snapshot().questions.find(q => q.id === overflowId).state, 'overflow');
+  // The overflowed question never entered `this.queue`, so it never reaches
+  // _pump(); its record must still be closed rather than left dangling in
+  // the active ring. getSummary() reflects it, and completing/failing it
+  // again is a safe no-op.
+  assert.equal(metrics.getSummary().count, 1);
+  assert.equal(metrics.complete(overflowId, clock.now()), null);
+});
+
 test('latency metrics: endSession closes out every still-queued record', () => {
   const clock = createClock(1000);
   const metrics = new LatencyMetrics();
@@ -471,6 +494,6 @@ test('latency metrics: endSession closes out every still-queued record', () => {
   controller.submit('Second?', 'typed');
   controller.submit('Third?', 'typed');
   controller.endSession();
-  // One active answer plus two queued ones — all three should be closed out.
+  // One active answer plus two queued ones, all three should be closed out.
   assert.equal(metrics.getSummary().count, 3);
 });
