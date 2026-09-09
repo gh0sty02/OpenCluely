@@ -239,6 +239,12 @@
         const teleprompterArea = document.getElementById('interviewWorkspace') || panel;
         teleprompterArea.addEventListener('wheel', () => { lastUserScrollAt = Date.now(); }, { passive: true });
         let lastTick = null;
+        // The DOM's own scrollTop is integer-rounded, and at 40px/s each
+        // frame's share is well under 1px — accumulating directly against
+        // scrollTop rounds every increment straight back down to itself and
+        // never visibly moves. Track the fractional position separately and
+        // only round when assigning it.
+        let fractionalScrollTop = null;
         const tick = now => {
             if (lastTick == null) lastTick = now;
             const dt = now - lastTick;
@@ -249,7 +255,14 @@
             const selection = window.getSelection();
             const readingSelection = selection && !selection.isCollapsed && teleprompterArea.contains(selection.anchorNode);
             if (idleLongEnough && !atBottom && !readingSelection) {
-                teleprompterArea.scrollTop += (AUTO_SCROLL_PX_PER_SEC * dt) / 1000;
+                if (fractionalScrollTop == null) fractionalScrollTop = teleprompterArea.scrollTop;
+                fractionalScrollTop += (AUTO_SCROLL_PX_PER_SEC * dt) / 1000;
+                teleprompterArea.scrollTop = fractionalScrollTop;
+            } else {
+                // Resync next time it engages, in case the user (or the
+                // stick-to-bottom follow logic in render()) moved it while
+                // paused.
+                fractionalScrollTop = null;
             }
             requestAnimationFrame(tick);
         };
