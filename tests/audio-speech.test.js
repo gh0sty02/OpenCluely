@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function service() {
+function service(overrides = {}) {
   const filename = path.join(__dirname, '../src/services/speech.service.js');
   const logger = { info() {}, warn() {}, error() {}, debug() {} };
   const context = { window: {}, Buffer, console, process: { ...process, env: {} }, setTimeout, clearTimeout,
@@ -13,7 +13,8 @@ function service() {
       if (name === '../core/config') return { get: () => undefined };
       if (name === './mistral.service') return { getApiKey: () => '' };
       if (name === './whisper-worker.service') return class { isConfigured() { return false; } releaseWhenIdle() {} close() {} };
-      if (name === 'microsoft-cognitiveservices-speech-sdk' || name === 'node-record-lpcm16') return {};
+      if (name === 'microsoft-cognitiveservices-speech-sdk') return overrides.sdk || {};
+      if (name === 'node-record-lpcm16') return {};
       return require(name);
     }
   };
@@ -103,4 +104,125 @@ test('renderer PCM is routed to Azure push stream without microphone capture', (
   speech.pushStream = { write: data => { received = Buffer.from(data); } };
   speech.handleAudioChunkFromRenderer(new Uint8Array([1, 2]).buffer);
   assert.deepEqual(received, Buffer.from([1, 2]));
+});
+
+test('voiced frames emit one speech start when VAD enters an utterance', async () => {
+  const speech = service();
+  const starts = [];
+  speech.on('speech-started', event => starts.push(event));
+  speech.startRecording();
+  const frame = Buffer.alloc(3200);
+  for (let offset = 0; offset < frame.length; offset += 2) frame.writeInt16LE(12000, offset);
+  speech._ingestWhisperAudio(frame);
+  speech._ingestWhisperAudio(frame);
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].captureId, speech.captureId);
+  assert.ok(Number.isFinite(starts[0].at));
+  assert.ok(starts[0].utteranceId);
+  await speech.stopRecording({ cancel: true });
+});
+
+test('Whisper emits one ordered lifecycle around every successful transcription', async () => {
+  const speech = service();
+  const events = [];
+  for (const name of ['speech-ended', 'transcription-started', 'transcription', 'transcription-settled']) {
+    speech.on(name, (textOrEvent, metadata) => events.push({ name, textOrEvent, metadata }));
+  }
+  speech._transcribeWhisperBuffer = async () => 'What is a closure?';
+  speech.startRecording();
+  buffer(speech, 1);
+  const speechEndedAt = 1234;
+  await speech._flushWhisperSegment(speechEndedAt);
+
+  assert.deepEqual(events.map(event => event.name), [
+    'speech-ended', 'transcription-started', 'transcription', 'transcription-settled'
+  ]);
+  const ended = events[0].textOrEvent;
+  const started = events[1].textOrEvent;
+  const transcriptMetadata = events[2].metadata;
+  const settled = events[3].textOrEvent;
+  assert.equal(new Set([ended.utteranceId, started.utteranceId, transcriptMetadata.utteranceId, settled.utteranceId]).size, 1);
+  assert.equal(new Set([ended.captureId, started.captureId, transcriptMetadata.captureId, settled.captureId]).size, 1);
+  assert.equal(new Set([ended.speechEndedAt, started.speechEndedAt, transcriptMetadata.speechEndedAt, settled.speechEndedAt]).size, 1);
+  assert.equal(settled.text, 'What is a closure?');
+  assert.equal(settled.errorCode, null);
+  await speech.stopRecording({ cancel: true });
+});
+
+test('a failed Whisper transcription settles once without emitting transcript text', async () => {
+  const speech = service();
+  const transcripts = [];
+  const settlements = [];
+  speech.on('transcription', text => transcripts.push(text));
+  speech.on('transcription-settled', event => settlements.push(event));
+  speech._transcribeWhisperBuffer = async () => { throw new Error('decoder failed'); };
+  speech.startRecording();
+  buffer(speech, 1);
+  await assert.rejects(speech._flushWhisperSegment(1234), /decoder failed/);
+  assert.deepEqual(transcripts, []);
+  assert.equal(settlements.length, 1);
+  assert.equal(settlements[0].text, '');
+  assert.ok(settlements[0].errorCode);
+  await speech.stopRecording({ cancel: true });
+});
+
+test('cancelled in-flight work settles once and never leaks into a restarted capture', async () => {
+  const speech = service();
+  const transcripts = [];
+  const settlements = [];
+  let finishOld;
+  speech.on('transcription', text => transcripts.push(text));
+  speech.on('transcription-settled', event => settlements.push(event));
+  speech._transcribeWhisperBuffer = () => new Promise(resolve => { finishOld = resolve; });
+  speech.startRecording();
+  const oldCaptureId = speech.captureId;
+  buffer(speech, 1);
+  const oldWork = speech._flushWhisperSegment(1234);
+  await Promise.resolve();
+  await speech.stopRecording({ cancel: true });
+  speech.startRecording();
+  finishOld('old question');
+  await oldWork;
+  assert.deepEqual(transcripts, []);
+  assert.equal(settlements.filter(event => event.captureId === oldCaptureId).length, 1);
+  assert.equal(settlements[0].errorCode, 'CANCELLED');
+  await speech.stopRecording({ cancel: true });
+});
+
+test('Azure final recognition emits one ordered lifecycle with stable identity', async () => {
+  let recognizer;
+  const sdk = {
+    ResultReason: { RecognizingSpeech: 1, RecognizedSpeech: 2 },
+    AudioInputStream: { createPushStream: () => ({ close() {} }) },
+    AudioConfig: { fromStreamInput: () => ({ close() {} }) },
+    SpeechRecognizer: class {
+      constructor() { recognizer = this; }
+      startContinuousRecognitionAsync(resolve) { resolve(); }
+      stopContinuousRecognitionAsync(resolve) { resolve(); }
+      close() {}
+    }
+  };
+  const speech = service({ sdk });
+  speech.provider = 'azure';
+  speech.speechConfig = {};
+  speech.available = true;
+  const events = [];
+  for (const name of ['speech-started', 'speech-ended', 'transcription-started', 'transcription', 'transcription-settled']) {
+    speech.on(name, (textOrEvent, metadata) => events.push({ name, textOrEvent, metadata }));
+  }
+
+  speech.startRecording();
+  recognizer.recognizing(null, { result: { reason: sdk.ResultReason.RecognizingSpeech, text: 'What' } });
+  recognizer.recognizing(null, { result: { reason: sdk.ResultReason.RecognizingSpeech, text: 'What is' } });
+  recognizer.recognized(null, { result: { reason: sdk.ResultReason.RecognizedSpeech, text: 'What is Azure?' } });
+
+  assert.deepEqual(events.map(event => event.name), [
+    'speech-started', 'speech-ended', 'transcription-started', 'transcription', 'transcription-settled'
+  ]);
+  const identities = [events[0].textOrEvent, events[1].textOrEvent, events[2].textOrEvent,
+    events[3].metadata, events[4].textOrEvent].map(event => event.utteranceId);
+  assert.equal(new Set(identities).size, 1);
+  assert.equal(events[4].textOrEvent.text, 'What is Azure?');
+  assert.equal(events[4].textOrEvent.errorCode, null);
+  await speech.stopRecording({ cancel: true });
 });

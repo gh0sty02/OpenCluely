@@ -430,6 +430,8 @@ class SpeechService extends EventEmitter {
     this.manualStopRequested = false;
     this.captureId = 0;
     this.utteranceSequence = 0;
+    this.activeSpeech = null;
+    this.activeTranscriptions = new Map();
     this.transcriptionTask = null;
     this.stopTask = null;
     this._resetVadState();
@@ -643,6 +645,7 @@ class SpeechService extends EventEmitter {
       if (this.captureId !== captureId) return;
       try {
         if (e.result.reason === sdk.ResultReason.RecognizingSpeech) {
+          this._beginSpeech(captureId);
           this.emit('interim-transcription', e.result.text);
         }
       } catch (error) {
@@ -652,11 +655,18 @@ class SpeechService extends EventEmitter {
 
     this.recognizer.recognized = (s, e) => {
       if (this.captureId !== captureId) return;
+      let item = null;
       try {
         if (e.result.reason === sdk.ResultReason.RecognizedSpeech && e.result.text && e.result.text.trim()) {
-          this.emit('transcription', e.result.text, { captureId, utteranceId: e.result.resultId || `${captureId}:${++this.utteranceSequence}` });
+          item = this._createTranscriptionItem(null, Date.now(), captureId);
+          const clean = e.result.text.trim();
+          this.emit('transcription', clean, item.lifecycle);
+          this._settleTranscription(item, clean, null);
+        } else if (e.result.reason === sdk.ResultReason.RecognizedSpeech && this.activeSpeech) {
+          this._settleActiveSpeech('NO_SPEECH', captureId);
         }
       } catch (error) {
+        this._settleTranscription(item, '', this._speechErrorCode(error));
         logger.error('Error in recognized handler', { error: error.message });
       }
     };
@@ -775,6 +785,75 @@ class SpeechService extends EventEmitter {
     this.vadPreRoll = [];            // ring of recent pre-speech chunks
     this.vadPreRollMs = 0;           // duration held in the pre-roll ring
     this.vadLastChunkAt = 0;         // timestamp of the last ingested chunk
+    this.activeSpeech = null;
+  }
+
+  _beginSpeech(captureId = this.captureId, at = Date.now()) {
+    if (this.activeSpeech && this.activeSpeech.captureId === captureId) {
+      return this.activeSpeech;
+    }
+    const speech = Object.freeze({
+      captureId,
+      utteranceId: `${captureId}:${++this.utteranceSequence}`,
+      at
+    });
+    this.activeSpeech = speech;
+    this.emit('speech-started', speech);
+    this.emit('speech-activity', { captureId });
+    return speech;
+  }
+
+  _createTranscriptionItem(audioBuffer, speechEndedAt = Date.now(), captureId = this.captureId) {
+    const speech = this.activeSpeech && this.activeSpeech.captureId === captureId
+      ? this.activeSpeech
+      : this._beginSpeech(captureId);
+    const endedAt = Number.isFinite(speechEndedAt) ? speechEndedAt : Date.now();
+    const lifecycle = Object.freeze({
+      captureId,
+      utteranceId: speech.utteranceId,
+      speechEndedAt: endedAt
+    });
+    const item = { audioBuffer, lifecycle, settled: false, cancelled: false };
+    this.activeSpeech = null;
+    this.activeTranscriptions.set(lifecycle.utteranceId, item);
+    this.emit('speech-ended', lifecycle);
+    this.emit('transcription-started', lifecycle);
+    return item;
+  }
+
+  _settleTranscription(item, text = '', errorCode = null) {
+    if (!item || item.settled) return;
+    item.settled = true;
+    this.activeTranscriptions.delete(item.lifecycle.utteranceId);
+    this.emit('transcription-settled', {
+      ...item.lifecycle,
+      text,
+      errorCode
+    });
+  }
+
+  _settleActiveSpeech(errorCode, captureId = this.captureId) {
+    if (!this.activeSpeech || this.activeSpeech.captureId !== captureId) return;
+    const item = this._createTranscriptionItem(null, Date.now(), captureId);
+    item.cancelled = true;
+    this._settleTranscription(item, '', errorCode);
+  }
+
+  _cancelTranscriptions(captureId) {
+    for (const item of this.activeTranscriptions.values()) {
+      if (item.lifecycle.captureId !== captureId) continue;
+      item.cancelled = true;
+      this._settleTranscription(item, '', 'CANCELLED');
+    }
+  }
+
+  _speechErrorCode(error) {
+    const code = error && typeof error.code === 'string' ? error.code.toUpperCase() : '';
+    return /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'TRANSCRIPTION_FAILED';
+  }
+
+  _safeSpeechMessage(error) {
+    return `Speech transcription failed: ${error && error.message ? error.message : 'Unknown error'}`;
   }
 
   /**
@@ -857,6 +936,7 @@ class SpeechService extends EventEmitter {
     }
 
     if (this._isManualCaptureMode()) {
+      if (!this.activeSpeech) this._beginSpeech();
       this.segmentBuffers.push(buffer);
       this.segmentBytes += buffer.length;
       this.vadLastChunkAt = Date.now();
@@ -872,6 +952,7 @@ class SpeechService extends EventEmitter {
 
     if (!this._isVadEnabled()) {
       // Legacy behaviour: the watchdog/max-utterance cap drives flushing.
+      if (!this.activeSpeech) this._beginSpeech();
       this.segmentBuffers.push(buffer);
       this.segmentBytes += buffer.length;
       this.vadSpeaking = true;
@@ -904,6 +985,7 @@ class SpeechService extends EventEmitter {
       if (isVoiced) {
         // Speech onset: prepend the pre-roll so the first syllable survives.
         this.vadSpeaking = true;
+        this._beginSpeech();
         this.vadSpeechMs = 0;
         this.vadSilenceMs = 0;
         for (const pre of this.vadPreRoll) {
@@ -958,6 +1040,7 @@ class SpeechService extends EventEmitter {
       this.vadSpeaking = false;
       this.vadSpeechMs = 0;
       this.vadSilenceMs = 0;
+      this._settleActiveSpeech('NO_SPEECH');
     }
   }
 
@@ -1004,6 +1087,10 @@ class SpeechService extends EventEmitter {
     });
 
     if (this.provider === 'azure' && this.recognizer) {
+      if (cancel) {
+        this._settleActiveSpeech('CANCELLED');
+        this._cancelTranscriptions(this.captureId);
+      }
       return new Promise((resolve) => {
         try {
           this.recognizer.stopContinuousRecognitionAsync(
@@ -1047,6 +1134,9 @@ class SpeechService extends EventEmitter {
    * starts (see `_runWhisperTranscription`).
    */
   _cancelWhisperSession() {
+    const captureId = this.captureId;
+    this._settleActiveSpeech('CANCELLED', captureId);
+    this._cancelTranscriptions(captureId);
     while (this.pendingSegments.length) {
       const item = this.pendingSegments.shift();
       item.resolve();
@@ -1076,7 +1166,9 @@ class SpeechService extends EventEmitter {
       await this._flushWhisperSegment();
     } catch (error) {
       logger.error('Final Whisper transcription failed', { error: error.message });
-      this.emit('error', `Whisper transcription failed: ${error.message}`);
+      if (!error.speechNotified) {
+        this.emit('error', `Whisper transcription failed: ${error.message}`);
+      }
     } finally {
       this._cleanup();
       this.isProcessingAudio = false;
@@ -1089,6 +1181,8 @@ class SpeechService extends EventEmitter {
   }
 
   _finalizeStop(statusMessage) {
+    this._settleActiveSpeech('CANCELLED');
+    this._cancelTranscriptions(this.captureId);
     this._cleanup();
     this.emit('recording-stopped');
     this.emit('status', statusMessage);
@@ -1904,18 +1998,6 @@ class SpeechService extends EventEmitter {
   async _flushWhisperSegment(speechEndedAt = Date.now()) {
     const captureId = this.captureId;
 
-    if (this.transcriptionInFlight) {
-      if (!this.segmentBytes) {
-        return;
-      }
-      const audioBuffer = Buffer.concat(this.segmentBuffers, this.segmentBytes);
-      this.segmentBuffers = [];
-      this.segmentBytes = 0;
-      return new Promise((resolve, reject) => {
-        this.pendingSegments.push({ buffer: audioBuffer, captureId, speechEndedAt, resolve, reject });
-      });
-    }
-
     if (!this.segmentBytes) {
       return;
     }
@@ -1923,30 +2005,55 @@ class SpeechService extends EventEmitter {
     const audioBuffer = Buffer.concat(this.segmentBuffers, this.segmentBytes);
     this.segmentBuffers = [];
     this.segmentBytes = 0;
+    const item = this._createTranscriptionItem(audioBuffer, speechEndedAt, captureId);
 
-    await this._runWhisperTranscription(audioBuffer, captureId, speechEndedAt);
+    if (this.transcriptionInFlight) {
+      return new Promise((resolve, reject) => {
+        item.resolve = resolve;
+        item.reject = reject;
+        this.pendingSegments.push(item);
+      });
+    }
+
+    await this._runWhisperTranscription(item);
   }
 
   /** Transcribe one segment, then hand off to the next queued segment (if any). */
-  async _runWhisperTranscription(audioBuffer, captureId, speechEndedAt = Date.now()) {
+  async _runWhisperTranscription(item) {
     this.transcriptionInFlight = true;
-    const utteranceId = `${captureId}:${++this.utteranceSequence}`;
+    let clean = '';
+    let errorCode = null;
 
     try {
-      const transcript = await this._transcribeWhisperBuffer(audioBuffer);
-      if (this.captureId !== captureId) {
-        // A newer session started (pause/cancel + restart) while this
-        // transcription was in flight; its result is stale, discard it.
+      const transcript = await this._transcribeWhisperBuffer(item.audioBuffer);
+      clean = transcript ? transcript.trim() : '';
+      if (item.cancelled || this.captureId !== item.lifecycle.captureId) {
+        errorCode = 'CANCELLED';
+        clean = '';
         return;
       }
-      const clean = transcript ? transcript.trim() : '';
       if (clean && !this._isHallucinatedTranscript(clean)) {
-        this.emit('transcription', clean, { captureId, utteranceId, speechEndedAt });
+        this.emit('transcription', clean, item.lifecycle);
       } else if (clean) {
         logger.debug('Dropped likely Whisper silence hallucination', { transcript: clean });
       }
+    } catch (error) {
+      if (item.cancelled || this.captureId !== item.lifecycle.captureId) {
+        errorCode = 'CANCELLED';
+        clean = '';
+        return;
+      }
+      errorCode = this._speechErrorCode(error);
+      if (error && typeof error === 'object') error.speechNotified = true;
+      this.emit('error', this._safeSpeechMessage(error));
+      throw error;
     } finally {
-      if (this.captureId === captureId) {
+      if (item.cancelled || this.captureId !== item.lifecycle.captureId) {
+        errorCode = 'CANCELLED';
+        clean = '';
+      }
+      this._settleTranscription(item, clean, errorCode);
+      if (this.captureId === item.lifecycle.captureId) {
         this.transcriptionInFlight = false;
       }
       await this._drainPendingSegments();
@@ -1955,12 +2062,16 @@ class SpeechService extends EventEmitter {
 
   /** Process the next queued segment, settling its caller's promise. */
   async _drainPendingSegments() {
-    if (!this.pendingSegments.length) {
+    if (this.transcriptionInFlight || !this.pendingSegments.length) {
       return;
     }
     const next = this.pendingSegments.shift();
+    if (next.cancelled || next.settled) {
+      next.resolve();
+      return this._drainPendingSegments();
+    }
     try {
-      await this._runWhisperTranscription(next.buffer, next.captureId, next.speechEndedAt);
+      await this._runWhisperTranscription(next);
       next.resolve();
     } catch (error) {
       next.reject(error);
