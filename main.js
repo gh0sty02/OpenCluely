@@ -1,25 +1,30 @@
 const path = require("path");
 const fs = require("fs");
 const { fileURLToPath } = require("url");
-const { app, BrowserWindow, globalShortcut, session, ipcMain } = require("electron");
+const { app, BrowserWindow, globalShortcut, session, ipcMain, desktopCapturer } = require("electron");
 
 // ── Resolve a stable .env location ──
 // In packaged builds process.cwd() is unstable and frequently read-only
 // (NSIS install dir, AppImage mount, .app bundle), so the canonical config
-// lives in Electron's userData directory. We still prefer an existing
-// project-local .env in development (npm start) so the dev workflow is
-// unchanged. Both onboarding (FirstRunManager) and persistEnvUpdates() write
-// to this same path so settings survive restarts on every platform.
+// lives in Electron's userData directory. In development (npm start) the
+// repo's own .env is always the source of truth — editing it, or saving
+// through the Settings UI, should both land in the one file a developer is
+// actually looking at. Both onboarding (FirstRunManager) and
+// persistEnvUpdates() write to this same resolved path so settings survive
+// restarts on every platform.
+//
+// This used to be "prefer project .env only if userData has none yet" —
+// which meant the FIRST settings save (or onboarding) ever created a
+// userData/.env, and from that point on every dev-mode launch silently
+// ignored the repo's .env forever, even though the comment above already
+// said dev should always use it. app.isPackaged is Electron's own signal
+// for packaged-vs-dev and doesn't depend on NODE_ENV being set correctly.
 function resolveEnvPath() {
   try {
-    const userDataEnv = path.join(app.getPath("userData"), ".env");
-    const projectEnv = path.join(process.cwd(), ".env");
-    // Prefer a project .env only when it already exists and userData has none
-    // (i.e. a developer running from the repo). Otherwise use userData.
-    if (!fs.existsSync(userDataEnv) && fs.existsSync(projectEnv)) {
-      return projectEnv;
+    if (!app.isPackaged) {
+      return path.join(process.cwd(), ".env");
     }
-    return userDataEnv;
+    return path.join(app.getPath("userData"), ".env");
   } catch (_) {
     // On packaged macOS builds, process.cwd() may be inside a read-only .app
     // bundle. Fall back to userData so .env writes never fail.
@@ -109,6 +114,10 @@ const llmService = require("./src/services/llm.factory");
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
 
+// Interview session coordinator and shared prompt composition
+const SessionController = require("./src/interview/session-controller");
+const { promptLoader } = require("./prompt-loader");
+
 class ApplicationController {
   constructor() {
     this.isReady = false;
@@ -126,6 +135,27 @@ class ApplicationController {
     this._utteranceTimer = null;
     this._utteranceDispatchInFlight = false;
     this._utteranceCoalesceMs = 800;
+
+    // Interview session coordinator: owns finalized-question queueing,
+    // deduplication, and answer-generation lifecycle for the interview
+    // panel UI (index.html/chat.html). Replaces the raw utterance-buffer
+    // dispatch above for anything routed through the interview flow.
+    this.interviewController = new SessionController({
+      generate: (question, options) => this.generateInterviewAnswer(question, options),
+    });
+    this.interviewController.setAutoAnswer(
+      process.env.AUTO_ANSWER === "true",
+      Number(process.env.AUTO_ANSWER_SILENCE_MS)
+    );
+    this.interviewController.on("state", (snapshot) => {
+      windowManager.broadcastToAllWindows("interview-state", snapshot);
+    });
+    // The interview sessionId active when speechService.startRecording() was
+    // last called for the interview flow. Transcripts are tagged with this
+    // (not a freshly-read sessionId) so acceptTranscript's staleness check
+    // correctly drops a transcript that resolves after the session ended
+    // or restarted while it was in flight.
+    this._interviewCaptureSessionId = null;
 
     // First-run onboarding: detects missing .env / API key and triggers
     // a settings-window prompt on first launch so users don't have to
@@ -387,6 +417,29 @@ class ApplicationController {
         callback(granted);
       }
     );
+
+    // Electron requires an explicit handler for renderer getDisplayMedia()
+    // calls (used by src/audio/capture.js for the default "system audio"
+    // source) — without one the call rejects immediately with
+    // NotSupportedError. We hand back the primary screen source with
+    // Chromium's WASAPI loopback flag so the resulting stream's audio track
+    // carries the whole system's audio (Windows-only capability; other
+    // platforms fall back to whatever Chromium supports for 'loopback').
+    appSession.setDisplayMediaRequestHandler((request, callback) => {
+      desktopCapturer
+        .getSources({ types: ["screen"] })
+        .then((sources) => {
+          if (!sources.length) {
+            callback({});
+            return;
+          }
+          callback({ video: sources[0], audio: "loopback" });
+        })
+        .catch((error) => {
+          logger.error("Failed to resolve a display-media source", { error: error.message });
+          callback({});
+        });
+    });
   }
 
   setupGlobalShortcuts() {
@@ -399,7 +452,7 @@ class ApplicationController {
       "CommandOrControl+Shift+\\": () => this.clearSessionMemory(),
       "CommandOrControl+,": () => windowManager.showSettings(),
       "Alt+A": () => windowManager.toggleInteraction(),
-      "Alt+R": () => this.toggleSpeechRecognition(),
+      "Alt+Shift+R": () => this.toggleSpeechRecognition(),
       "CommandOrControl+Shift+T": () => windowManager.forceAlwaysOnTopForAllWindows(),
       "CommandOrControl+Shift+Alt+T": () => {
         const results = windowManager.testAlwaysOnTopForAllWindows();
@@ -427,8 +480,30 @@ class ApplicationController {
       windowManager.handleRecordingStopped();
     });
 
-    speechService.on("transcription", (text) => {
-      this.handleTranscriptionFragment(text);
+    // Finalized transcripts are routed through the interview session
+    // coordinator, which owns question boundaries, deduplication (by
+    // utterance identity), and dispatch — see acceptTranscript() in
+    // src/interview/session-controller.js. A null _interviewCaptureSessionId
+    // (no interview capture has started) makes the coordinator drop the event.
+    speechService.on("transcription", (text, metadata = {}) => {
+      const fragment = (text || "").trim();
+      if (!fragment) return;
+      this.interviewController.acceptTranscript({
+        sessionId: this._interviewCaptureSessionId,
+        utteranceId: metadata.utteranceId || `${metadata.captureId || 0}:${Date.now()}`,
+        source: this.interviewController.source,
+        text: fragment,
+        final: true,
+        speechEndedAt: metadata.speechEndedAt,
+      });
+    });
+
+    // Fires the instant VAD detects the speaker resuming — well before that
+    // fragment is transcribed — so an auto-answer countdown started by the
+    // previous fragment gets held off immediately rather than racing a slow
+    // Whisper pass into firing early and splitting one question in two.
+    speechService.on("speech-activity", () => {
+      this.interviewController.noteActivity();
     });
 
     speechService.on("interim-transcription", (text) => {
@@ -493,6 +568,84 @@ class ApplicationController {
       if (data && data.buffer) {
         speechService.handleAudioChunkFromRenderer(Buffer.from(data.buffer));
       }
+    });
+
+    // Interview session coordinator (index.html / chat.html interview panel).
+    ipcMain.handle("interview-action", async (_event, name, payload = {}) => {
+      try {
+        switch (name) {
+          case "start": {
+            const source = process.env.AUDIO_SOURCE === "microphone" ? "microphone" : "system";
+            this.interviewController.startSession({ source });
+            this._interviewCaptureSessionId = this.interviewController.sessionId;
+            speechService.startRecording();
+            break;
+          }
+          case "resume":
+            this.interviewController.resume();
+            speechService.startRecording();
+            break;
+          case "pause":
+            // Flush and transcribe whatever trailing audio is still buffered
+            // or mid-transcription (the words spoken right up to the click)
+            // BEFORE building the question — cancelling here (as before) threw
+            // that tail away, so the answer was generated on an incomplete
+            // question. This is why pause() itself is not called until after
+            // the flush: it also triggers answerNow(), which must run last.
+            this.interviewController.setCaptureState("paused");
+            await speechService.stopRecording();
+            this.interviewController.answerNow();
+            break;
+          case "end":
+            this.interviewController.endSession();
+            speechService.stopRecording({ cancel: true });
+            break;
+          case "clear":
+            this.interviewController.clearSession();
+            speechService.stopRecording({ cancel: true });
+            break;
+          case "submit":
+            this.interviewController.submit(payload.text, "typed");
+            break;
+          case "answer-now":
+            this.interviewController.answerNow();
+            break;
+          case "set-auto-answer": {
+            const enabled = Boolean(payload.enabled);
+            const silenceMs = Number(payload.silenceMs);
+            this.interviewController.setAutoAnswer(enabled, silenceMs);
+            this.persistEnvUpdates({
+              AUTO_ANSWER: enabled ? "true" : "false",
+              ...(Number.isFinite(silenceMs) && silenceMs > 0 ? { AUTO_ANSWER_SILENCE_MS: String(silenceMs) } : {}),
+            });
+            break;
+          }
+          case "retry":
+            this.interviewController.retry(payload.questionId);
+            break;
+          case "stop-answer":
+            this.interviewController.stopAnswer(payload.questionId);
+            break;
+          default:
+            return { error: `Unknown interview action: ${name}` };
+        }
+        return this.interviewController.snapshot();
+      } catch (error) {
+        return { error: error.message || "Action failed. Try again." };
+      }
+    });
+
+    ipcMain.handle("get-interview-state", () => this.interviewController.snapshot());
+
+    // Capture-lifecycle reports from the renderer's AudioCapture (level meter
+    // and starting/listening/error transitions); see src/audio/capture.js and
+    // interview-panel.js.
+    ipcMain.on("interview-capture-level", (_event, level) => {
+      this.interviewController.setLevel(level);
+    });
+    ipcMain.on("interview-capture-state", (_event, data) => {
+      if (!data || typeof data.state !== "string") return;
+      this.interviewController.setCaptureState(data.state, data.error || "");
     });
 
     // Also handle direct send events for fallback
@@ -1229,6 +1382,45 @@ class ApplicationController {
    * asked once the speaker has actually paused — this is what stops one spoken
    * line from producing two separate, slow answers.
    */
+  /**
+   * `generate` dependency for the interview session controller. Composes the
+   * interview prompt (shared policy + bounded recent Q&A history) and streams
+   * the answer through the active provider's generateAnswer(), which honors
+   * `signal` for Stop answer / session end and reports partial text via
+   * `onDelta` as the controller streams it into the UI.
+   */
+  async generateInterviewAnswer(question, { signal, onDelta } = {}) {
+    const history = this.interviewController.questions
+      .filter((item) => item.id !== question.id && item.state === "completed" && item.answer)
+      .flatMap((item) => [
+        { role: "user", content: item.text },
+        { role: "assistant", content: item.answer },
+      ]);
+    const messages = promptLoader.composeMessages({
+      text: question.text,
+      activeSkill: this.interviewController.mode,
+      programmingLanguage: this.codingLanguage,
+      history,
+    });
+    try {
+      const result = await llmService.generateAnswer({ messages, signal, onDelta });
+      return result.text;
+    } catch (error) {
+      // session-controller stores this on the question and shows it in the
+      // UI, but never logs it — without this, a provider failure here is
+      // invisible in ~/.OpenCluely/logs.
+      logger.error("Interview answer generation failed", {
+        code: error.code,
+        error: error.message,
+        provider: llmService.constructor && llmService.constructor.name,
+        host: llmService.host,
+        path: llmService.path,
+        model: llmService.model,
+      });
+      throw error;
+    }
+  }
+
   handleTranscriptionFragment(text) {
     const fragment = (text || "").trim();
     if (!fragment) {
@@ -1593,6 +1785,9 @@ class ApplicationController {
     return {
       codingLanguage: this.codingLanguage || "cpp",
       activeSkill: this.activeSkill || "dsa",
+      audioSource: process.env.AUDIO_SOURCE === "microphone" ? "microphone" : "system",
+      autoAnswer: process.env.AUTO_ANSWER === "true",
+      autoAnswerSilenceMs: Number(process.env.AUTO_ANSWER_SILENCE_MS) || 2500,
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
       windowGap: windowManager.windowGap,
@@ -1608,14 +1803,17 @@ class ApplicationController {
         (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
+      mistralKey: process.env.MISTRAL_API_KEY || "",
       geminiKey: process.env.GEMINI_API_KEY || "",
 
       // OpenRouter provider fields
       llmProvider: process.env.LLM_PROVIDER || "gemini",
       openrouterKey: process.env.OPENROUTER_API_KEY || "",
       openrouterModel: process.env.OPENROUTER_MODEL || "anthropic/claude-sonnet-4",
+      openrouterBaseUrl: process.env.OPENROUTER_BASE_URL || "",
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
+      mistralConfigured: !!process.env.MISTRAL_API_KEY,
       speechAvailable: this.speechAvailable
     };
   }
@@ -1634,6 +1832,9 @@ class ApplicationController {
         windowManager.broadcastToAllWindows("skill-updated", {
           skill: settings.activeSkill,
         });
+        // The interview panel's "Answer style" selector reuses this same
+        // setting; keep the coordinator's prompt-selection mode in sync.
+        this.interviewController.setMode(settings.activeSkill);
       }
       if (settings.appIcon) {
         this.appIcon = settings.appIcon;
@@ -1652,7 +1853,7 @@ class ApplicationController {
       // Writing to .env ensures they survive app restarts and are picked
       // up the next time the app boots.
       const envUpdates = {};
-      if (settings.speechProvider === "azure" || settings.speechProvider === "whisper") {
+      if (["azure", "whisper", "mistral"].includes(settings.speechProvider)) {
         envUpdates.SPEECH_PROVIDER = settings.speechProvider;
       }
       if (settings.azureKey !== undefined) {
@@ -1682,8 +1883,14 @@ class ApplicationController {
       if (settings.whisperSegmentMs !== undefined) {
         envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
       }
+      if (settings.mistralKey !== undefined) {
+        envUpdates.MISTRAL_API_KEY = settings.mistralKey;
+      }
       if (settings.geminiKey !== undefined) {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
+      }
+      if (settings.audioSource === "system" || settings.audioSource === "microphone") {
+        envUpdates.AUDIO_SOURCE = settings.audioSource;
       }
 
       // OpenRouter provider settings
@@ -1696,12 +1903,16 @@ class ApplicationController {
       if (settings.openrouterModel !== undefined) {
         envUpdates.OPENROUTER_MODEL = String(settings.openrouterModel || '').trim();
       }
+      if (settings.openrouterBaseUrl !== undefined) {
+        envUpdates.OPENROUTER_BASE_URL = String(settings.openrouterBaseUrl || '').trim();
+      }
 
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
       // mutates process.env in place, so comparing afterwards would always read
       // equal and skip the speech re-init below (the exact stale-mic-after-install
       // bug the re-init guards against).
       const prevWhisperCommand = process.env.WHISPER_COMMAND || '';
+      const prevMistralKey = process.env.MISTRAL_API_KEY || '';
 
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
@@ -1723,7 +1934,7 @@ class ApplicationController {
 
       // If the OpenRouter key or model was saved and the current runtime service is
       // OpenRouter, reinitialize its client so changes take effect immediately.
-      if (envUpdates.OPENROUTER_API_KEY !== undefined || envUpdates.OPENROUTER_MODEL !== undefined) {
+      if (envUpdates.OPENROUTER_API_KEY !== undefined || envUpdates.OPENROUTER_MODEL !== undefined || envUpdates.OPENROUTER_BASE_URL !== undefined) {
         try {
           if (llmService.constructor && llmService.constructor.name === 'OpenRouterService') {
             llmService.initializeClient();
@@ -1752,7 +1963,9 @@ class ApplicationController {
       const providerChanged = settings.speechProvider && speechService.provider !== settings.speechProvider;
       const whisperCommandChanged = settings.whisperCommand !== undefined &&
         prevWhisperCommand !== String(settings.whisperCommand || '');
-      if (providerChanged || whisperCommandChanged) {
+      const mistralKeyChanged = settings.mistralKey !== undefined &&
+        prevMistralKey !== String(settings.mistralKey || '');
+      if (providerChanged || whisperCommandChanged || mistralKeyChanged) {
         try {
           speechService.initializeClient();
           this.speechAvailable = speechService.isAvailable
@@ -1770,6 +1983,7 @@ class ApplicationController {
           logger.info('Speech service reinitialized after settings change', {
             providerChanged,
             whisperCommandChanged,
+            mistralKeyChanged,
             speechAvailable: this.speechAvailable,
           });
         } catch (e) {
